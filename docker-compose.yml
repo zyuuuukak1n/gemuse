@@ -1,0 +1,112 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: muse-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-muse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-muse_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-personal_muse}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/app/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-muse} -d ${POSTGRES_DB:-personal_muse}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - internal_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: muse-redis
+    restart: unless-stopped
+    command:
+      - sh
+      - -c
+      - 'redis-server --appendonly yes --requirepass "${REDIS_PASSWORD:-redis_dev_password}"'
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_dev_password}
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:-redis_dev_password}\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    networks:
+      - internal_net
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: personal-muse-backend:latest
+    container_name: muse-backend
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "127.0.0.1:${APP_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+      - shared_files:/shared_files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    networks:
+      - internal_net
+      - app_net
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: personal-muse-backend:latest
+    container_name: muse-worker
+    restart: unless-stopped
+    command: ["arq", "app.worker.tasks.WorkerSettings"]
+    env_file:
+      - path: .env
+        required: false
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+      - shared_files:/shared_files
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - internal_net
+      - app_net
+
+networks:
+  internal_net:
+    driver: bridge
+    internal: true
+  app_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  redisdata:
+  shared_files:
