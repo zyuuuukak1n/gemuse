@@ -11,7 +11,7 @@ services:
       - pgdata:/var/lib/postgresql/data
       - ./backend/app/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-muse} -d ${POSTGRES_DB:-personal_muse}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-muse} -d ${POSTGRES_DB:-personal_muse}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -32,7 +32,7 @@ services:
     volumes:
       - redisdata:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:-redis_dev_password}\" ping | grep -q PONG"]
+      test: [ "CMD-SHELL", "redis-cli -a \"${REDIS_PASSWORD:-redis_dev_password}\" ping | grep -q PONG" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -51,7 +51,7 @@ services:
       - path: .env
         required: false
     ports:
-      - "127.0.0.1:${APP_PORT:-8000}:8000"
+      - "127.0.0.1:${BACKEND_PORT:-8005}:8000"
     volumes:
       - ./data:/app/data
       - ./config:/app/config:ro
@@ -62,11 +62,7 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""
-        ]
+      test: [ "CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\"" ]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -82,7 +78,7 @@ services:
     image: personal-muse-backend:latest
     container_name: muse-worker
     restart: unless-stopped
-    command: ["arq", "app.worker.tasks.WorkerSettings"]
+    command: [ "arq", "app.worker.tasks.WorkerSettings" ]
     env_file:
       - path: .env
         required: false

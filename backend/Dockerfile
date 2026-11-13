@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Copy application code
 COPY app /app/app
 COPY pytest.ini /app/pytest.ini
+COPY tests /app/tests
 
 # Prepare runtime directories with appropriate ownership
 RUN mkdir -p /app/data /app/config /shared_files \
