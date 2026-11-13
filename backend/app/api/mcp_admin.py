@@ -1,12 +1,25 @@
 """MCP Hub Admin API: connector statuses and Discord permission summaries."""
 
 from typing import Any
+import uuid
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel, Field
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import ApprovalRequiredError
+from app.db.session import get_db_session
 from app.mcp_hub.manager import MCPHubManager
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp-admin"])
+
+
+class ExecuteToolRequest(BaseModel):
+    """Payload to invoke an MCP tool explicitly (used after ApprovalCard resolution or Settings test)."""
+
+    tool_name: str = Field(..., min_length=1, max_length=128)
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    approval_id: uuid.UUID | None = None
 
 
 def get_mcp_hub(request: Request) -> MCPHubManager:
@@ -25,6 +38,28 @@ async def get_mcp_status(
         "tools": tools,
         "connectors": connectors,
     }
+
+
+@router.post("/execute")
+async def execute_mcp_tool(
+    body: ExecuteToolRequest,
+    mcp_hub: MCPHubManager = Depends(get_mcp_hub),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Execute a registered MCP tool through ToolRegistry (physically enforces ApprovalService)."""
+    try:
+        result = await mcp_hub.tool_registry.execute_tool(
+            body.tool_name,
+            body.arguments,
+            db=db,
+            approval_id=body.approval_id,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ApprovalRequiredError as exc:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)) from exc
+    await db.commit()
+    return result.model_dump()
 
 
 @router.get("/discord/permissions")

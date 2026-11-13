@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
+import time
 import uuid
 from typing import Any
 
@@ -292,7 +294,47 @@ async def proxy_novnc_http(
     )
 
 
-def _is_ws_authorized(websocket: WebSocket, settings: Settings) -> bool:
+def _issue_vnc_ticket(secret: str, session_id: str, ttl_seconds: int = 300) -> tuple[str, int]:
+    expires_at = int(time.time()) + ttl_seconds
+    msg = f"vnc:{session_id}:{expires_at}".encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return f"{expires_at}.{sig}", expires_at
+
+
+def _verify_vnc_ticket(secret: str, session_id: str, raw_ticket: str) -> bool:
+    if not raw_ticket or "." not in raw_ticket or not secret:
+        return False
+    exp_str, provided_sig = raw_ticket.split(".", 1)
+    try:
+        expires_at = int(exp_str)
+    except ValueError:
+        return False
+    if int(time.time()) > expires_at:
+        return False
+    msg = f"vnc:{session_id}:{expires_at}".encode("utf-8")
+    expected_sig = hmac.new(secret.encode("utf-8"), msg, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(provided_sig, expected_sig)
+
+
+@router.post("/sessions/{session_id}/vnc-ticket")
+async def create_vnc_ticket(
+    session_id: str,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """Issue a short-lived, session-scoped HMAC ticket for direct WebSocket noVNC upgrade."""
+    ticket, expires_at = _issue_vnc_ticket(settings.APPROVAL_HMAC_SECRET, session_id)
+    return {
+        "session_id": session_id,
+        "ticket": ticket,
+        "expires_at": expires_at,
+    }
+
+
+def _is_ws_authorized(websocket: WebSocket, settings: Settings, session_id: str) -> bool:
+    ticket_param = websocket.query_params.get("ticket", "").strip()
+    if ticket_param and _verify_vnc_ticket(settings.APPROVAL_HMAC_SECRET, session_id, ticket_param):
+        return True
+
     auth_header = websocket.headers.get("authorization", "").strip()
     token_param = websocket.query_params.get("token", "").strip()
     candidate = ""
@@ -309,7 +351,7 @@ def _is_ws_authorized(websocket: WebSocket, settings: Settings) -> bool:
 async def proxy_novnc_websocket(websocket: WebSocket, session_id: str) -> None:
     """Authenticated WebSocket proxy forwarding noVNC RFB frames to gemuse-browser."""
     settings: Settings = getattr(websocket.app.state, "settings", get_settings())
-    if not _is_ws_authorized(websocket, settings):
+    if not _is_ws_authorized(websocket, settings, session_id):
         await websocket.close(code=1008, reason="Unauthorized")
         return
 

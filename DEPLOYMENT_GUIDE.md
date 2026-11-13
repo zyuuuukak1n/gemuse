@@ -6,6 +6,7 @@ This guide describes how to deploy **Gemuse** on any Linux host running Docker a
 
 - Docker Engine 24+ and Docker Compose v2
 - Python 3.12+ (optional, for local test execution)
+- Node.js 20+ (optional, for local frontend tests)
 - A Google Gemini API key (`GEMINI_API_KEY`)
 
 ## 1. Clone and Configure Environment
@@ -24,7 +25,7 @@ python3 -c "import secrets; print('APPROVAL_HMAC_SECRET=' + secrets.token_urlsaf
 python3 -c "import secrets; print('GEMUSE_INGEST_TOKEN=' + secrets.token_urlsafe(36))"
 ```
 
-Update `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `DATABASE_URL`, `REDIS_URL`, `GEMINI_API_KEY`, and any optional Step 2 / Step 3 service credentials inside `.env` (Discord, Mail, Google, X/YouTube, `NOVNC_PASSWORD`, `DISCORD_NOTIFY_WEBHOOK_URL`, `VAPID_*`, `TWILIO_*`, `PUBLIC_BASE_URL`).
+Update `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `DATABASE_URL`, `REDIS_URL`, `GEMINI_API_KEY`, `FRONTEND_PORT`, `NEXT_PUBLIC_APP_DOMAIN`, and any optional Step 2 / Step 3 / Step 4 credentials inside `.env` (Discord, Mail, Google, X/YouTube, `NOVNC_PASSWORD`, `DISCORD_NOTIFY_WEBHOOK_URL`, `VAPID_*`, `NEXT_PUBLIC_VAPID_PUBLIC_KEY`, `TWILIO_*`, `PUBLIC_BASE_URL`).
 
 To generate VAPID keys for Web Push notifications:
 
@@ -53,6 +54,7 @@ docker compose ps
 
 ```bash
 curl -s http://127.0.0.1:8005/health
+curl -s http://127.0.0.1:3005/api/health
 docker compose exec backend pytest -v
 ```
 
@@ -64,4 +66,6 @@ Expected health response:
 
 ## 5. Reverse Proxy Recommendations
 
-The backend binds strictly to `127.0.0.1:${BACKEND_PORT:-8005}`. Place a TLS-terminating reverse proxy (Nginx, Apache2, Caddy, or Cloudflare Tunnel) in front of `http://127.0.0.1:8005/`, enable WebSocket proxying for `/api/browser/vnc/*/websockify` and `/api/voice/stream`, and disable response buffering for Server-Sent Events (`/api/chat`).
+- `gemuse-frontend` binds strictly to `127.0.0.1:${FRONTEND_PORT:-3005}` and serves the PWA UI and BFF proxy (`/api/auth/*`, `/api/proxy/*`).
+- `gemuse-backend` binds strictly to `127.0.0.1:${BACKEND_PORT:-8005}` for direct external webhook/WS paths (`/api/voice/*`, `/api/sync/ingest-chat`, `/api/browser/vnc/*/websockify`).
+- Place a TLS-terminating reverse proxy (Nginx, Apache2, Caddy, or Cloudflare Tunnel) in front, disable response buffering for SSE (`/api/proxy/chat`), and enable WebSocket upgrades for noVNC and Twilio Media Streams.

@@ -4,10 +4,10 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -155,4 +155,83 @@ async def chat_endpoint(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/conversations")
+async def list_conversations(
+    limit: int = Query(default=30, ge=1, le=100),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """List recent conversations along with latest job status for sidebar rendering."""
+    stmt = (
+        select(Conversation)
+        .options(selectinload(Conversation.jobs))
+        .order_by(desc(Conversation.updated_at))
+        .limit(limit)
+    )
+    rows = (await db.execute(stmt)).scalars().all()
+    items: list[dict[str, Any]] = []
+    for conv in rows:
+        sorted_jobs = sorted(conv.jobs, key=lambda j: j.created_at, reverse=True)
+        latest_job = sorted_jobs[0] if sorted_jobs else None
+        items.append(
+            {
+                "id": str(conv.id),
+                "title": conv.title,
+                "latest_job_status": latest_job.status if latest_job else None,
+                "latest_job_id": str(latest_job.id) if latest_job else None,
+                "thinking_level": latest_job.thinking_level if latest_job else "auto",
+                "created_at": conv.created_at.isoformat(),
+                "updated_at": conv.updated_at.isoformat(),
+            }
+        )
+    return {"items": items}
+
+
+@router.get("/conversations/{conversation_id}")
+async def get_conversation_detail(
+    conversation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Retrieve a conversation with ordered messages, citations, and jobs."""
+    stmt = (
+        select(Conversation)
+        .options(selectinload(Conversation.messages), selectinload(Conversation.jobs))
+        .where(Conversation.id == conversation_id)
+    )
+    conv = (await db.execute(stmt)).scalar_one_or_none()
+    if conv is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+    messages = sorted(conv.messages, key=lambda m: m.created_at)
+    jobs = sorted(conv.jobs, key=lambda j: j.created_at, reverse=True)
+    return {
+        "id": str(conv.id),
+        "title": conv.title,
+        "created_at": conv.created_at.isoformat(),
+        "updated_at": conv.updated_at.isoformat(),
+        "messages": [
+            {
+                "id": str(m.id),
+                "role": m.role,
+                "content": m.content,
+                "thinking_summary": m.thinking_summary,
+                "citations": list(m.citations or []),
+                "attachments": list(m.attachments or []),
+                "created_at": m.created_at.isoformat(),
+            }
+            for m in messages
+        ],
+        "jobs": [
+            {
+                "job_id": str(j.id),
+                "status": j.status,
+                "thinking_level": j.thinking_level,
+                "created_at": j.created_at.isoformat(),
+            }
+            for j in jobs[:10]
+        ],
+    }
 

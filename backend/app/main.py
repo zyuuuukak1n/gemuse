@@ -19,6 +19,7 @@ from app.api import (
     approval,
     browser,
     chat,
+    dashboard,
     jobs,
     mcp_admin,
     memory,
@@ -229,6 +230,7 @@ def create_app(
     app.include_router(browser.router, dependencies=auth_dep)
     app.include_router(browser.ws_router)
     app.include_router(proactive.router, dependencies=auth_dep)
+    app.include_router(dashboard.router, dependencies=auth_dep)
     app.include_router(voice_webhook.router)
 
     return app

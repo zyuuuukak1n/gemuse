@@ -25,7 +25,10 @@ class Settings(BaseSettings):
     APP_HOST: str = "127.0.0.1"
     APP_PORT: int = Field(default=8000, ge=1, le=65535)
     BACKEND_PORT: int = Field(default=8005, ge=1, le=65535)
-    CORS_ORIGINS: str = "https://gemuse.zyuuuukak1n.dev,https://gemini.google.com,http://localhost:3000"
+    CORS_ORIGINS: str = (
+        "https://gemuse.zyuuuukak1n.dev,https://gemini.google.com,"
+        "http://localhost:3000,http://localhost:3005,http://127.0.0.1:3005"
+    )
 
     # Security & Auth
     API_SECRET_TOKEN: str = Field(..., min_length=16)

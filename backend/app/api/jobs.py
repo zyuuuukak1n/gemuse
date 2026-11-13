@@ -3,9 +3,9 @@
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Job, Message
@@ -26,6 +26,35 @@ class JobResponse(BaseModel):
     latest_citations: list[str]
     created_at: datetime
     updated_at: datetime
+
+
+@router.get("")
+async def list_jobs(
+    limit: int = Query(default=25, ge=1, le=100),
+    status_filter: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, list[dict[str, object]]]:
+    """List recent background and streaming jobs ordered newest first."""
+    stmt = select(Job).order_by(desc(Job.created_at)).limit(limit)
+    if status_filter:
+        stmt = stmt.where(Job.status == status_filter)
+    rows = (await db.execute(stmt)).scalars().all()
+    return {
+        "items": [
+            {
+                "job_id": str(j.id),
+                "conversation_id": str(j.conversation_id),
+                "status": j.status,
+                "thinking_level": j.thinking_level,
+                "prompt_preview": j.prompt[:160],
+                "result_summary": j.result_summary,
+                "error_message": j.error_message,
+                "created_at": j.created_at.isoformat(),
+                "updated_at": j.updated_at.isoformat(),
+            }
+            for j in rows
+        ]
+    }
 
 
 @router.get("/{job_id}", response_model=JobResponse)

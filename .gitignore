@@ -40,3 +40,11 @@ redisdata/
 .DS_Store
 Thumbs.db
 
+# Node / Next.js
+node_modules/
+.next/
+out/
+next-env.d.ts
+npm-debug.log*
+*.tsbuildinfo
+
