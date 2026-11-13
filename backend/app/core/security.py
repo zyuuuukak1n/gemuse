@@ -117,6 +117,27 @@ async def verify_api_auth(
     )
 
 
+async def verify_ingest_auth(
+    request: Request,
+    settings: Settings = Depends(get_settings),
+) -> dict[str, Any]:
+    """
+    Authenticate external chat ingest requests.
+
+    Accepts standard API Bearer / CF Access JWT OR `X-Gemuse-Ingest-Token`
+    matching `settings.GEMUSE_INGEST_TOKEN` in constant time.
+    """
+    ingest_token = request.headers.get("X-Gemuse-Ingest-Token", "").strip()
+    if (
+        settings.GEMUSE_INGEST_TOKEN
+        and ingest_token
+        and hmac.compare_digest(ingest_token, settings.GEMUSE_INGEST_TOKEN)
+    ):
+        return {"auth_method": "ingest_token"}
+
+    return await verify_api_auth(request, settings)
+
+
 class ApprovalService:
     """Physical execution lock using HMAC-SHA256 signed one-time approval tokens."""
 
@@ -342,5 +363,86 @@ class ApprovalService:
             await db.commit()
             await db.refresh(record)
 
+        return record
+
+    async def verify_and_consume_by_token(
+        self,
+        db: AsyncSession,
+        *,
+        action_type: str,
+        raw_token: str,
+        now: datetime | None = None,
+    ) -> ApprovalRequest:
+        """
+        Verify a raw one-time approval token directly and consume it atomically.
+
+        Used by irreversible MCP tools (`mail_send_email`, `discord_post_message`,
+        `discord_update_pinned_summary`, `calendar_create_event`).
+        """
+        cleaned = (raw_token or "").strip()
+        if not cleaned:
+            raise ApprovalRequiredError(
+                f"Action '{action_type}' requires a valid approval_token",
+                action_type=action_type,
+            )
+
+        token_hash = self.hash_token(cleaned)
+        result = await db.execute(
+            select(ApprovalRequest).where(ApprovalRequest.token_hash == token_hash)
+        )
+        record = result.scalar_one_or_none()
+        if record is None:
+            raise ApprovalRequiredError(
+                "Invalid or unrecognized approval_token; execution blocked",
+                action_type=action_type,
+            )
+
+        if record.action_type != action_type:
+            raise ApprovalRequiredError(
+                "Approval action_type mismatch; execution blocked",
+                approval_id=str(record.id),
+                action_type=action_type,
+            )
+
+        current_time = now or datetime.now(timezone.utc)
+        record_expires = record.expires_at
+        if record_expires.tzinfo is None:
+            record_expires = record_expires.replace(tzinfo=timezone.utc)
+        if current_time > record_expires:
+            if record.status == "pending":
+                record.status = "expired"
+                record.resolved_at = current_time
+                await db.commit()
+            raise ApprovalRequiredError(
+                "Approval token has expired; execution blocked",
+                approval_id=str(record.id),
+                action_type=action_type,
+            )
+
+        self.verify_token_signature(
+            cleaned,
+            approval_id=str(record.id),
+            action_type=record.action_type,
+            expected_hash=record.token_hash,
+            now=current_time,
+        )
+
+        if record.status != "approved":
+            raise ApprovalRequiredError(
+                f"Approval request is '{record.status}', not 'approved'; execution blocked",
+                approval_id=str(record.id),
+                action_type=action_type,
+            )
+
+        if record.consumed_at is not None:
+            raise ApprovalRequiredError(
+                "Approval token has already been consumed; replay blocked",
+                approval_id=str(record.id),
+                action_type=action_type,
+            )
+
+        record.consumed_at = current_time
+        await db.commit()
+        await db.refresh(record)
         return record
 

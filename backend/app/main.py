@@ -9,15 +9,16 @@ from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.agent.consolidator import ConsolidationClientProtocol, GeminiConsolidationClient
 from app.agent.memory import MemoryService
 from app.agent.orchestrator import AgentOrchestrator, GoogleGenAIStreamProvider, LLMStreamProvider
-from app.api import approval, chat, jobs, memory
+from app.api import approval, chat, jobs, mcp_admin, memory, sync
 from app.core.config import Settings, get_settings
-from app.core.logging import configure_logging, get_logger, mask_secrets, register_secret
+from app.core.logging import configure_logging, get_logger, mask_secrets
 from app.core.security import ApprovalRequiredError, ApprovalService, verify_api_auth
 from app.db.session import create_engine_and_sessionmaker, init_db
-from app.mcp_hub.base import ToolRegistry
-from app.worker.tasks import build_memory_service
+from app.sync.gemini_bridge import GeminiBridgeService
+from app.worker.tasks import build_mcp_hub, build_memory_service, register_settings_secrets
 
 logger = get_logger(__name__)
 
@@ -30,19 +31,25 @@ class _UnconfiguredLLMProvider(LLMStreamProvider):
         yield  # pragma: no cover
 
 
+class _UnconfiguredConsolidationClient:
+    """Safe fallback consolidation client when GEMINI_API_KEY is not configured."""
+
+    async def generate_json(self, system_prompt: str, user_prompt: str) -> str:
+        return '{"core_memory_updates": [], "episodes": [], "skill_candidate": null}'
+
+
 def create_app(
     settings_override: Settings | None = None,
     *,
     llm_provider_override: LLMStreamProvider | None = None,
     memory_service_override: MemoryService | None = None,
+    consolidation_client_override: ConsolidationClientProtocol | None = None,
     enable_redis: bool = True,
 ) -> FastAPI:
-    """Build and configure the Personal Muse FastAPI application."""
+    """Build and configure the Gemuse FastAPI application."""
     settings = settings_override or get_settings()
     configure_logging(settings.LOG_LEVEL)
-    register_secret(settings.API_SECRET_TOKEN)
-    register_secret(settings.APPROVAL_HMAC_SECRET)
-    register_secret(settings.GEMINI_API_KEY)
+    register_settings_secrets(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -56,7 +63,11 @@ def create_app(
             settings.APPROVAL_HMAC_SECRET,
             default_ttl_seconds=settings.APPROVAL_TOKEN_TTL_SECONDS,
         )
-        tool_registry = ToolRegistry(approval_service=approval_service)
+        mcp_hub, discord_connector = await build_mcp_hub(
+            settings,
+            approval_service=approval_service,
+            session_factory=db_session_factory,
+        )
 
         if llm_provider_override is not None:
             llm_provider = llm_provider_override
@@ -65,12 +76,27 @@ def create_app(
         else:
             llm_provider = _UnconfiguredLLMProvider()
 
+        if consolidation_client_override is not None:
+            consolidation_client: ConsolidationClientProtocol = consolidation_client_override
+        elif settings.GEMINI_API_KEY and not settings.GEMINI_API_KEY.startswith("your-"):
+            consolidation_client = GeminiConsolidationClient(
+                api_key=settings.GEMINI_API_KEY,
+                model_name=settings.GEMINI_MODEL,
+            )
+        else:
+            consolidation_client = _UnconfiguredConsolidationClient()
+
         orchestrator = AgentOrchestrator(
             model_name=settings.GEMINI_MODEL,
             llm_provider=llm_provider,
             memory_service=memory_service,
-            tool_registry=tool_registry,
+            tool_registry=mcp_hub.tool_registry,
             approval_service=approval_service,
+            mcp_hub=mcp_hub,
+        )
+        gemini_bridge = GeminiBridgeService(
+            memory_service=memory_service,
+            consolidation_client=consolidation_client,
         )
 
         arq_pool = None
@@ -86,23 +112,27 @@ def create_app(
         app.state.settings = settings
         app.state.memory_service = memory_service
         app.state.approval_service = approval_service
-        app.state.tool_registry = tool_registry
+        app.state.mcp_hub = mcp_hub
+        app.state.discord_connector = discord_connector
+        app.state.tool_registry = mcp_hub.tool_registry
         app.state.orchestrator = orchestrator
+        app.state.gemini_bridge = gemini_bridge
         if not hasattr(app.state, "arq_pool") or app.state.arq_pool is None:
             app.state.arq_pool = arq_pool
 
-        logger.info("Personal Muse API started", extra={"env": settings.APP_ENV})
+        logger.info("Gemuse API started", extra={"env": settings.APP_ENV})
         try:
             yield
         finally:
+            await mcp_hub.shutdown()
             if arq_pool is not None:
                 await arq_pool.close()
             await db_engine.dispose()
-            logger.info("Personal Muse API stopped")
+            logger.info("Gemuse API stopped")
 
     app = FastAPI(
         title=settings.APP_NAME,
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
 
@@ -114,7 +144,12 @@ def create_app(
         allow_origins=settings.cors_origins_list,
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "Cf-Access-Jwt-Assertion"],
+        allow_headers=[
+            "Authorization",
+            "Content-Type",
+            "Cf-Access-Jwt-Assertion",
+            "X-Gemuse-Ingest-Token",
+        ],
     )
 
     @app.exception_handler(ApprovalRequiredError)
@@ -148,6 +183,8 @@ def create_app(
     app.include_router(jobs.router, dependencies=auth_dep)
     app.include_router(memory.router, dependencies=auth_dep)
     app.include_router(approval.router, dependencies=auth_dep)
+    app.include_router(mcp_admin.router, dependencies=auth_dep)
+    app.include_router(sync.router)
 
     return app
 

@@ -1,7 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "version": "1.0.0",
-  "description": "Plugin-style MCP server definitions (populated in Step 2)",
+  "description": "Plugin-style external MCP server definitions (stdio or sse transports)",
   "servers": []
 }
-

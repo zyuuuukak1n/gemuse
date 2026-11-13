@@ -1,17 +1,17 @@
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: muse-postgres
+    container_name: gemuse-postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-muse}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-muse_dev_password}
-      POSTGRES_DB: ${POSTGRES_DB:-personal_muse}
+      POSTGRES_USER: ${POSTGRES_USER:-gemuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gemuse_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-gemuse}
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./backend/app/db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
-      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-muse} -d ${POSTGRES_DB:-personal_muse}" ]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-gemuse} -d ${POSTGRES_DB:-gemuse}" ]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -21,7 +21,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: muse-redis
+    container_name: gemuse-redis
     restart: unless-stopped
     command:
       - sh
@@ -44,8 +44,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: personal-muse-backend:latest
-    container_name: muse-backend
+    image: gemuse-backend:latest
+    container_name: gemuse-backend
     restart: unless-stopped
     env_file:
       - path: .env
@@ -75,8 +75,8 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
-    image: personal-muse-backend:latest
-    container_name: muse-worker
+    image: gemuse-backend:latest
+    container_name: gemuse-worker
     restart: unless-stopped
     command: [ "arq", "app.worker.tasks.WorkerSettings" ]
     env_file:

@@ -1,15 +1,15 @@
-# Discord Server-by-Server Permission Whitelist Template (Step 2)
+# Discord Server-by-Server Permission Whitelist (Step 2)
+# Supported permission levels:
+#   - disabled: block all reads and writes
+#   - read_only: allow channel listing, history reading, and search; physically block all writes
+#   - read_write: allow reads plus posting & pinned summary edits (with valid ApprovalService token)
 version: "1.0.0"
-default_policy: deny
+default_policy: disabled
 
 servers: []
-  # Example (activated in Step 2):
+  # Example:
   # - guild_id: "123456789012345678"
   #   name: "Personal Workspace"
+  #   permission: "read_only"
   #   allowed_channels:
   #     - "987654321098765432"
-  #   read_only: true
-  #   require_approval_for:
-  #     - send_message
-  #     - add_reaction
-

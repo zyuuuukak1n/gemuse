@@ -1,6 +1,6 @@
 # Deployment Guide (Generic)
 
-This guide describes how to deploy **Personal Muse (Step 1)** on any Linux host running Docker and Docker Compose v2.
+This guide describes how to deploy **Gemuse** on any Linux host running Docker and Docker Compose v2.
 
 ## Prerequisites
 
@@ -11,8 +11,8 @@ This guide describes how to deploy **Personal Muse (Step 1)** on any Linux host 
 ## 1. Clone and Configure Environment
 
 ```bash
-git clone <your-repository-url> personal-muse
-cd personal-muse
+git clone <your-repository-url> gemuse
+cd gemuse
 cp .env.example .env
 ```
 
@@ -21,9 +21,10 @@ Generate cryptographically strong secrets and update `.env`:
 ```bash
 python3 -c "import secrets; print('API_SECRET_TOKEN=' + secrets.token_urlsafe(48))"
 python3 -c "import secrets; print('APPROVAL_HMAC_SECRET=' + secrets.token_urlsafe(48))"
+python3 -c "import secrets; print('GEMUSE_INGEST_TOKEN=' + secrets.token_urlsafe(36))"
 ```
 
-Update `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `DATABASE_URL`, `REDIS_URL`, and `GEMINI_API_KEY` inside `.env`.
+Update `POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `DATABASE_URL`, `REDIS_URL`, `GEMINI_API_KEY`, and any optional Step 2 service credentials inside `.env`.
 
 ## 2. Host Directory Permissions
 
@@ -42,19 +43,19 @@ docker compose up -d --build
 docker compose ps
 ```
 
-## 4. Verify Health
+## 4. Verify Health & Run Tests
 
 ```bash
-curl -s http://127.0.0.1:8000/health
+curl -s http://127.0.0.1:8005/health
+docker compose exec backend pytest -v
 ```
 
-Expected response:
+Expected health response:
 
 ```json
-{"status":"ok","service":"Personal Muse"}
+{"status":"ok","service":"Gemuse"}
 ```
 
 ## 5. Reverse Proxy Recommendations
 
-The backend binds strictly to `127.0.0.1:${APP_PORT:-8000}`. Place a TLS-terminating reverse proxy (Nginx, Apache2, Caddy, or Cloudflare Tunnel) in front of `http://127.0.0.1:8000/` and ensure response buffering is disabled for Server-Sent Events (`/api/chat`).
-
+The backend binds strictly to `127.0.0.1:${BACKEND_PORT:-8005}`. Place a TLS-terminating reverse proxy (Nginx, Apache2, Caddy, or Cloudflare Tunnel) in front of `http://127.0.0.1:8005/` and ensure response buffering is disabled for Server-Sent Events (`/api/chat`).

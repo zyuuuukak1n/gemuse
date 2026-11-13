@@ -29,6 +29,7 @@ from app.mcp_hub.base import MCPToolDefinition
 
 TEST_API_TOKEN = "test-api-secret-token-1234567890"
 TEST_HMAC_SECRET = "test-approval-hmac-secret-1234567890"
+TEST_INGEST_TOKEN = "test-gemuse-ingest-token-1234567890"
 
 
 class MockGeminiStreamProvider(LLMStreamProvider):
@@ -78,6 +79,7 @@ def test_settings(tmp_path: Path) -> Settings:
         API_SECRET_TOKEN=TEST_API_TOKEN,
         APPROVAL_HMAC_SECRET=TEST_HMAC_SECRET,
         APPROVAL_TOKEN_TTL_SECONDS=600,
+        GEMUSE_INGEST_TOKEN=TEST_INGEST_TOKEN,
         DATABASE_URL=f"sqlite+aiosqlite:///{tmp_path / 'test.db'}",
         REDIS_URL="redis://localhost:6379/0",
         GEMINI_API_KEY="",

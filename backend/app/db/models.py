@@ -1,4 +1,4 @@
-"""SQLAlchemy ORM models for Personal Muse."""
+"""SQLAlchemy ORM models for Gemuse."""
 
 import uuid
 from datetime import datetime, timezone

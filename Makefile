@@ -1,7 +1,7 @@
 .PHONY: help up down build logs ps test lint clean
 
 help:
-	@echo "Personal Muse - Available commands:"
+	@echo "Gemuse - Available commands:"
 	@echo "  make up       - Start all services in detached mode"
 	@echo "  make down     - Stop all services"
 	@echo "  make build    - Build Docker images"
@@ -30,4 +30,3 @@ test:
 
 clean:
 	docker compose down -v
-

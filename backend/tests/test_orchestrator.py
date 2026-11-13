@@ -30,7 +30,7 @@ def test_thinking_level_router_boundaries() -> None:
 
     # XHigh: architecture design + security audit + multi-question long prompt
     d_xhigh = route_thinking_level(
-        "Personal Museの全体構成とアーキテクチャ設計について、トレードオフとセキュリティ監査の"
+        "Gemuseの全体構成とアーキテクチャ設計について、トレードオフとセキュリティ監査の"
         "観点から段階的に比較検討してください。\n1. DB設計は？\n2. 承認ゲートは？\n3. MCP拡張は？"
     )
     assert d_xhigh.level == "xhigh"

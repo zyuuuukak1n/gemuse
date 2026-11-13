@@ -19,17 +19,19 @@ class Settings(BaseSettings):
     )
 
     # Application
-    APP_NAME: str = "Personal Muse"
+    APP_NAME: str = "Gemuse"
     APP_ENV: Literal["development", "production", "test"] = "production"
     LOG_LEVEL: str = "INFO"
     APP_HOST: str = "127.0.0.1"
     APP_PORT: int = Field(default=8000, ge=1, le=65535)
-    CORS_ORIGINS: str = "http://localhost:3000"
+    BACKEND_PORT: int = Field(default=8005, ge=1, le=65535)
+    CORS_ORIGINS: str = "https://gemuse.zyuuuukak1n.dev,https://gemini.google.com,http://localhost:3000"
 
     # Security & Auth
     API_SECRET_TOKEN: str = Field(..., min_length=16)
     APPROVAL_HMAC_SECRET: str = Field(..., min_length=16)
     APPROVAL_TOKEN_TTL_SECONDS: int = Field(default=600, ge=30, le=86400)
+    GEMUSE_INGEST_TOKEN: str = ""
 
     CF_ACCESS_ENABLED: bool = False
     CF_ACCESS_TEAM_DOMAIN: str = ""
@@ -53,6 +55,36 @@ class Settings(BaseSettings):
     CONFIG_DIR: Path = Path("/app/config")
     MEMORY_SIMILARITY_THRESHOLD: float = Field(default=0.55, ge=0.0, le=1.0)
     MEMORY_TOP_K: int = Field(default=5, ge=1, le=50)
+    MCP_TOOL_TIMEOUT_SECONDS: float = Field(default=15.0, ge=1.0, le=120.0)
+
+    # Step 2: Discord Multi-Server Integration
+    DISCORD_BOT_TOKEN: str = ""
+    DISCORD_API_BASE_URL: str = "https://discord.com/api/v10"
+
+    # Step 2: Multi-Mail Integration (Outlook / iCloud / Gmail)
+    OUTLOOK_CLIENT_ID: str = ""
+    OUTLOOK_CLIENT_SECRET: str = ""
+    OUTLOOK_TENANT_ID: str = ""
+    OUTLOOK_REFRESH_TOKEN: str = ""
+
+    ICLOUD_EMAIL: str = ""
+    ICLOUD_APP_PASSWORD: str = ""
+    ICLOUD_IMAP_HOST: str = "imap.mail.me.com"
+    ICLOUD_IMAP_PORT: int = Field(default=993, ge=1, le=65535)
+    ICLOUD_SMTP_HOST: str = "smtp.mail.me.com"
+    ICLOUD_SMTP_PORT: int = Field(default=587, ge=1, le=65535)
+
+    # Step 2: Google Workspace (Gmail / Calendar / Drive)
+    GOOGLE_OAUTH_CLIENT_ID: str = ""
+    GOOGLE_OAUTH_CLIENT_SECRET: str = ""
+    GOOGLE_OAUTH_REFRESH_TOKEN: str = ""
+    GOOGLE_CALENDAR_ID: str = "primary"
+
+    # Step 2: Social & Media (X / YouTube)
+    X_BEARER_TOKEN: str = ""
+    X_USER_ID: str = ""
+    YOUTUBE_API_KEY: str = ""
+    YOUTUBE_OAUTH_REFRESH_TOKEN: str = ""
 
     @field_validator("LOG_LEVEL")
     @classmethod
@@ -65,11 +97,13 @@ class Settings(BaseSettings):
 
     @property
     def cors_origins_list(self) -> list[str]:
-        return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+        origins = [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+        if "https://gemini.google.com" not in origins:
+            origins.append("https://gemini.google.com")
+        return origins
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     """Return cached Settings instance."""
     return Settings()
-

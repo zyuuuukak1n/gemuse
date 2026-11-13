@@ -92,7 +92,7 @@ async def test_memory_consolidator_extracts_facts_and_resolves_contradictions(
                 {
                     "action": "add",
                     "target_fact": None,
-                    "new_fact": "Building Personal Muse on Ubuntu Docker",
+                    "new_fact": "Building Gemuse on Ubuntu Docker",
                 },
             ],
             "episodes": [
@@ -127,7 +127,7 @@ async def test_memory_consolidator_extracts_facts_and_resolves_contradictions(
     updated_core = await memory_service.read_core_memory()
     assert "Green Tea" not in updated_core
     assert "- Favorite drink: Espresso (updated)" in updated_core
-    assert "- Building Personal Muse on Ubuntu Docker" in updated_core
+    assert "- Building Gemuse on Ubuntu Docker" in updated_core
 
     episodes = await memory_service.search_episodes(
         db_session, query="Espresso drink", top_k=3, threshold=0.05

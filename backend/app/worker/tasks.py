@@ -5,6 +5,7 @@ from typing import Any
 
 from arq.connections import RedisSettings
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.agent.consolidator import GeminiConsolidationClient, MemoryConsolidator
@@ -20,9 +21,38 @@ from app.core.logging import configure_logging, get_logger, register_secret
 from app.core.security import ApprovalService
 from app.db.models import Conversation, Job
 from app.db.session import close_db, get_session_factory, init_db
-from app.mcp_hub.base import ToolRegistry
+from app.mcp_hub.manager import MCPHubManager
+from app.mcp_hub.servers.discord_mcp import DiscordMCPConnector
+from app.mcp_hub.servers.google_mcp import GoogleWorkspaceMCPConnector
+from app.mcp_hub.servers.mail_mcp import (
+    GmailMailClient,
+    ICloudMailClient,
+    MailMCPConnector,
+    OutlookMailClient,
+)
+from app.mcp_hub.servers.social_mcp import SocialMediaMCPConnector
 
 logger = get_logger(__name__)
+
+
+def register_settings_secrets(settings: Settings) -> None:
+    """Register all configured secrets so SecretMaskingFilter redacts them."""
+    for secret_val in (
+        settings.API_SECRET_TOKEN,
+        settings.APPROVAL_HMAC_SECRET,
+        settings.GEMUSE_INGEST_TOKEN,
+        settings.GEMINI_API_KEY,
+        settings.DISCORD_BOT_TOKEN,
+        settings.OUTLOOK_CLIENT_SECRET,
+        settings.OUTLOOK_REFRESH_TOKEN,
+        settings.ICLOUD_APP_PASSWORD,
+        settings.GOOGLE_OAUTH_CLIENT_SECRET,
+        settings.GOOGLE_OAUTH_REFRESH_TOKEN,
+        settings.X_BEARER_TOKEN,
+        settings.YOUTUBE_API_KEY,
+        settings.YOUTUBE_OAUTH_REFRESH_TOKEN,
+    ):
+        register_secret(secret_val)
 
 
 def build_embedding_provider(settings: Settings) -> EmbeddingProvider:
@@ -43,6 +73,74 @@ def build_memory_service(settings: Settings) -> MemoryService:
         similarity_threshold=settings.MEMORY_SIMILARITY_THRESHOLD,
         top_k=settings.MEMORY_TOP_K,
     )
+
+
+async def build_mcp_hub(
+    settings: Settings,
+    *,
+    approval_service: ApprovalService,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    load_external: bool = True,
+) -> tuple[MCPHubManager, DiscordMCPConnector]:
+    """Construct and initialize MCPHubManager with graceful credential degradation."""
+    hub = MCPHubManager(
+        approval_service=approval_service,
+        tool_timeout_seconds=settings.MCP_TOOL_TIMEOUT_SECONDS,
+    )
+
+    discord_connector = DiscordMCPConnector(
+        bot_token=settings.DISCORD_BOT_TOKEN,
+        permissions_path=settings.CONFIG_DIR / "discord_permissions.yaml",
+        approval_service=approval_service,
+        session_factory=session_factory,
+        api_base_url=settings.DISCORD_API_BASE_URL,
+    )
+    mail_connector = MailMCPConnector(
+        providers={
+            "outlook": OutlookMailClient(
+                client_id=settings.OUTLOOK_CLIENT_ID,
+                client_secret=settings.OUTLOOK_CLIENT_SECRET,
+                tenant_id=settings.OUTLOOK_TENANT_ID,
+                refresh_token=settings.OUTLOOK_REFRESH_TOKEN,
+            ),
+            "icloud": ICloudMailClient(
+                email_address=settings.ICLOUD_EMAIL,
+                app_password=settings.ICLOUD_APP_PASSWORD,
+                imap_host=settings.ICLOUD_IMAP_HOST,
+                imap_port=settings.ICLOUD_IMAP_PORT,
+                smtp_host=settings.ICLOUD_SMTP_HOST,
+                smtp_port=settings.ICLOUD_SMTP_PORT,
+            ),
+            "gmail": GmailMailClient(
+                client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
+                client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
+                refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN,
+            ),
+        },
+        approval_service=approval_service,
+        session_factory=session_factory,
+    )
+    google_connector = GoogleWorkspaceMCPConnector(
+        client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
+        client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
+        refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN,
+        calendar_id=settings.GOOGLE_CALENDAR_ID,
+        approval_service=approval_service,
+        session_factory=session_factory,
+    )
+    social_connector = SocialMediaMCPConnector(
+        x_bearer_token=settings.X_BEARER_TOKEN,
+        x_user_id=settings.X_USER_ID,
+        youtube_api_key=settings.YOUTUBE_API_KEY,
+    )
+
+    for connector in (discord_connector, mail_connector, google_connector, social_connector):
+        await hub.register_connector(connector)
+
+    if load_external:
+        await hub.load_external_mcp_servers(settings.CONFIG_DIR / "mcp_servers.json")
+
+    return hub, discord_connector
 
 
 async def consolidate_memory_task(
@@ -83,7 +181,16 @@ async def run_agent_job(ctx: dict[str, Any], job_id: str) -> dict[str, Any]:
         settings.APPROVAL_HMAC_SECRET,
         default_ttl_seconds=settings.APPROVAL_TOKEN_TTL_SECONDS,
     )
-    tool_registry: ToolRegistry = ctx.get("tool_registry") or ToolRegistry(approval_service)
+
+    mcp_hub: MCPHubManager | None = ctx.get("mcp_hub")
+    if mcp_hub is None:
+        mcp_hub, _ = await build_mcp_hub(
+            settings,
+            approval_service=approval_service,
+            session_factory=session_factory,
+            load_external=False,
+        )
+    tool_registry = ctx.get("tool_registry") or mcp_hub.tool_registry
 
     llm_provider = ctx.get("llm_provider")
     if llm_provider is None:
@@ -95,6 +202,7 @@ async def run_agent_job(ctx: dict[str, Any], job_id: str) -> dict[str, Any]:
         memory_service=memory_service,
         tool_registry=tool_registry,
         approval_service=approval_service,
+        mcp_hub=mcp_hub,
     )
 
     parsed_job_id = uuid.UUID(job_id)
@@ -144,26 +252,36 @@ async def startup(ctx: dict[str, Any]) -> None:
     """Initialize worker resources on ARQ startup."""
     settings = get_settings()
     configure_logging(settings.LOG_LEVEL)
-    register_secret(settings.API_SECRET_TOKEN)
-    register_secret(settings.APPROVAL_HMAC_SECRET)
-    register_secret(settings.GEMINI_API_KEY)
+    register_settings_secrets(settings)
 
     await init_db()
-    ctx["settings"] = settings
-    ctx["session_factory"] = get_session_factory()
-    ctx["memory_service"] = build_memory_service(settings)
-    ctx["approval_service"] = ApprovalService(
+    session_factory = get_session_factory()
+    approval_service = ApprovalService(
         settings.APPROVAL_HMAC_SECRET,
         default_ttl_seconds=settings.APPROVAL_TOKEN_TTL_SECONDS,
     )
-    ctx["tool_registry"] = ToolRegistry(ctx["approval_service"])
-    logger.info("ARQ worker initialized")
+    mcp_hub, _ = await build_mcp_hub(
+        settings,
+        approval_service=approval_service,
+        session_factory=session_factory,
+    )
+
+    ctx["settings"] = settings
+    ctx["session_factory"] = session_factory
+    ctx["memory_service"] = build_memory_service(settings)
+    ctx["approval_service"] = approval_service
+    ctx["mcp_hub"] = mcp_hub
+    ctx["tool_registry"] = mcp_hub.tool_registry
+    logger.info("Gemuse ARQ worker initialized")
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     """Dispose worker resources on ARQ shutdown."""
+    mcp_hub: MCPHubManager | None = ctx.get("mcp_hub")
+    if mcp_hub is not None:
+        await mcp_hub.shutdown()
     await close_db()
-    logger.info("ARQ worker shut down")
+    logger.info("Gemuse ARQ worker shut down")
 
 
 def _get_redis_settings() -> RedisSettings:
@@ -180,4 +298,3 @@ class WorkerSettings:
     redis_settings = _get_redis_settings()
     max_jobs = 10
     job_timeout = 600
-

@@ -1,2 +1,1 @@
-"""Test suite package for Personal Muse."""
-
+"""Test suite package for Gemuse."""

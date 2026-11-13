@@ -1,2 +1,1 @@
-"""Personal Muse backend package."""
-
+"""Gemuse backend package."""

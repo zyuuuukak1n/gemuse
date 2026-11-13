@@ -164,7 +164,7 @@ async def test_memory_core_episodes_and_skills_endpoints(
     # Seed episode and skill, then query via API
     await memory_service.add_episode(
         db_session,
-        content="Deployed Personal Muse backend on Ubuntu Server",
+        content="Deployed Gemuse backend on Ubuntu Server",
         source_type="conversation",
         importance_score=0.8,
     )
@@ -183,7 +183,7 @@ async def test_memory_core_episodes_and_skills_endpoints(
     )
     assert ep_resp.status_code == 200
     assert len(ep_resp.json()) == 1
-    assert "Personal Muse" in ep_resp.json()[0]["content"]
+    assert "Gemuse" in ep_resp.json()[0]["content"]
 
     skills_resp = await api_client.get("/api/memory/skills", headers=auth_headers)
     assert skills_resp.status_code == 200

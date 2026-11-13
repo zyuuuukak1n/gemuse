@@ -54,7 +54,7 @@ class ConsolidationResult(BaseModel):
     skill_saved: str | None = None
 
 
-_CONSOLIDATION_SYSTEM_PROMPT = """You are the Memory Consolidator for Personal Muse.
+_CONSOLIDATION_SYSTEM_PROMPT = """You are the Memory Consolidator for Gemuse.
 Analyze the latest conversation turn alongside the existing Layer 1 Core Memory.
 Extract ONLY durable, high-signal facts about the user's preferences, rules, schedule, projects, or important knowledge.
 
