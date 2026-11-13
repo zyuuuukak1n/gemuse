@@ -1,19 +1,55 @@
-# Proactive Briefing & Alert Rules Template (Step 3)
+# Gemuse Step 3 Proactive Notification & Briefing Rules
 version: "1.0.0"
 timezone: "Asia/Tokyo"
 
-schedules: []
-  # Example (activated in Step 3):
-  # - id: "morning_briefing"
-  #   cron: "0 8 * * *"
-  #   enabled: false
-  #   thinking_level: "medium"
-  #   prompt: "Summarize today's schedule, urgent emails, and pending tasks."
+schedules:
+  - id: morning_briefing
+    name: "朝の統合ブリーフィング"
+    enabled: true
+    cron: "30 7 * * *"
+    channels:
+      - discord_webhook
+      - web_push
+    include_calendar: true
+    include_mail: true
+    include_memory_context: true
 
-alert_rules: []
-  # Example:
-  # - id: "urgent_mention"
-  #   source: "discord"
-  #   keywords: ["urgent", "障害", "至急"]
-  #   notify_channel: "pwa_push"
+  - id: event_watcher
+    name: "イベント駆動先回りアラート"
+    enabled: true
+    interval_minutes: 15
+    channels:
+      - discord_webhook
+      - web_push
 
+alert_rules:
+  - id: calendar_deadline_24h
+    type: calendar_reminder
+    enabled: true
+    within_hours: 24
+    title_keywords:
+      - "締切"
+      - "提出"
+      - "deadline"
+      - "面接"
+      - "面談"
+      - "試験"
+      - "予約"
+    priority: high
+    message_template: "24時間以内の重要予定があります: {summary} ({start})"
+
+  - id: urgent_interview_email
+    type: mail_keyword
+    enabled: true
+    keywords:
+      - "面接"
+      - "面談"
+      - "日程調整"
+      - "急ぎ"
+      - "至急"
+      - "urgent"
+      - "interview"
+      - "deadline"
+    cross_check_calendar: true
+    priority: urgent
+    message_template: "重要メールを検知しました: {subject} (From: {sender})"

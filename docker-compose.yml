@@ -95,6 +95,36 @@ services:
       - internal_net
       - app_net
 
+  browser:
+    build:
+      context: ./browser-sandbox
+      dockerfile: Dockerfile
+    image: gemuse-browser:latest
+    container_name: gemuse-browser
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - SCREEN_WIDTH=1280
+      - SCREEN_HEIGHT=800
+      - SCREEN_DEPTH=24
+    volumes:
+      - browser_profile:/browser_profile
+      - shared_files:/shared_files
+    shm_size: "1gb"
+    healthcheck:
+      test: [ "CMD", "curl", "-fsS", "http://127.0.0.1:7000/health" ]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - internal_net
+      - app_net
+
 networks:
   internal_net:
     driver: bridge
@@ -106,3 +136,4 @@ volumes:
   pgdata:
   redisdata:
   shared_files:
+  browser_profile:

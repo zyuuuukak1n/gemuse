@@ -67,6 +67,14 @@ async def init_db(engine: AsyncEngine | None = None) -> None:
         if conn.dialect.name == "postgresql":
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
         await conn.run_sync(Base.metadata.create_all)
+        if conn.dialect.name == "postgresql":
+            await conn.execute(
+                text(
+                    "ALTER TABLE browser_audit_logs "
+                    "ADD COLUMN IF NOT EXISTS session_id VARCHAR(128), "
+                    "ADD COLUMN IF NOT EXISTS screenshot_path TEXT"
+                )
+            )
 
 
 async def close_db() -> None:

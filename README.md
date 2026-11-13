@@ -6,7 +6,7 @@ Self-hosted personal AI agent platform powered by **Gemini 4 Hydrogen** (`gemini
 
 - **Step 1 (Implemented)**: Core backend, Docker Compose stack (`postgres` with `pgvector`, `redis`, `backend`, `worker`), 3-layer memory & `MemoryConsolidator`, dynamic thinking-level router (`low` / `medium` / `high` / `xhigh`), SSE streaming & ARQ background jobs, HMAC-SHA256 one-time approval gates, FastAPI API, and full `pytest` suite.
 - **Step 2 (Implemented)**: Unified `gemuse` branding, plugin-based `MCPHubManager` with graceful credential degradation & external `mcp_servers.json` loading, multi-server Discord integration (`config/discord_permissions.yaml`), unified Mail (Outlook Graph / iCloud IMAP+SMTP / Gmail), Google Workspace (Calendar & Drive), X & YouTube Data/Transcript connectors, and Official Gemini One-Click Bridge (`gemini_bridge` + Takeout importer).
-- **Step 3 (Planned)**: Isolated noVNC browser sandbox (`browser-sandbox/`), manual handover, proactive briefings (`config/proactive_rules.yaml`), and voice bridge.
+- **Step 3 (Implemented)**: Isolated headful Chromium + Xvfb + x11vnc + noVNC sandbox (`browser-sandbox/`), `BrowserController` Computer Use loop with prompt-injection & checkout auto-pause guardrails, Take Control locks & authenticated noVNC reverse proxy (`/api/browser/*`), shared `/shared_files` upload/download bridge, APScheduler proactive morning briefings & event alerts (`config/proactive_rules.yaml`, Discord Webhook + Web Push VAPID, Redis 48h idempotency), and Twilio Media Streams <-> Gemini Live bidirectional voice bridge (`/api/voice/*` + approval-gated `voice_make_call`).
 - **Step 4 (Planned)**: Next.js PWA frontend (`frontend/`).
 
 ## Quick Start

@@ -1,5 +1,6 @@
 """Abstract MCP connector & tool definitions with JSON Schema generation and approval gating."""
 
+import contextvars
 import inspect
 import json
 import types
@@ -15,6 +16,10 @@ from app.core.logging import get_logger
 from app.core.security import ApprovalRequiredError, ApprovalService, wrap_untrusted_data
 
 logger = get_logger(__name__)
+
+approval_already_verified_ctx: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "gemuse_approval_already_verified", default=False
+)
 
 
 def _python_type_to_json_schema(annotation: Any) -> dict[str, Any]:
@@ -274,7 +279,11 @@ class ToolRegistry:
                 )
 
         if isinstance(owner, MCPTool):
-            safe_output = await owner.execute(arguments)
+            token = approval_already_verified_ctx.set(tool_def.requires_approval)
+            try:
+                safe_output = await owner.execute(arguments)
+            finally:
+                approval_already_verified_ctx.reset(token)
         else:
             raw_output = await owner.call_tool(tool_name, arguments)
             safe_output = wrap_untrusted_data(f"{tool_def.source_type}:{tool_name}", raw_output)

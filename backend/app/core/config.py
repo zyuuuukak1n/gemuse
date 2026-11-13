@@ -86,6 +86,27 @@ class Settings(BaseSettings):
     YOUTUBE_API_KEY: str = ""
     YOUTUBE_OAUTH_REFRESH_TOKEN: str = ""
 
+    # Step 3: Isolated Browser Sandbox & noVNC
+    BROWSER_SANDBOX_URL: str = "http://browser:7000"
+    BROWSER_NOVNC_URL: str = "http://browser:6080"
+    NOVNC_PASSWORD: str = ""
+    BROWSER_ARTIFACT_TTL_SECONDS: int = Field(default=86400, ge=60, le=2592000)
+
+    # Step 3: Proactive Engine & Notifications
+    PROACTIVE_RULES_PATH: str = "/app/config/proactive_rules.yaml"
+    PROACTIVE_TIMEZONE: str = "Asia/Tokyo"
+    DISCORD_NOTIFY_WEBHOOK_URL: str = ""
+    VAPID_PUBLIC_KEY: str = ""
+    VAPID_PRIVATE_KEY: str = ""
+    VAPID_CLAIMS_EMAIL: str = "mailto:admin@example.com"
+
+    # Step 3: Twilio Voice Bridge & Gemini Live API
+    TWILIO_ACCOUNT_SID: str = ""
+    TWILIO_AUTH_TOKEN: str = ""
+    TWILIO_PHONE_NUMBER: str = ""
+    PUBLIC_BASE_URL: str = ""
+    GEMINI_LIVE_MODEL: str = "gemini-4-hydrogen-live"
+
     @field_validator("LOG_LEVEL")
     @classmethod
     def validate_log_level(cls, value: str) -> str:

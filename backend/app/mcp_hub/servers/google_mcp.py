@@ -72,6 +72,21 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         resp.raise_for_status()
         return resp.json().get("items") or []
 
+    async def list_events_structured(self, time_min: str, time_max: str) -> list[dict[str, Any]]:
+        """Return normalized structured calendar events without wrapping."""
+        async with self._create_client() as client:
+            token = await self._get_access_token(client)
+            events = await self._fetch_events(client, token, time_min, time_max)
+        return [
+            {
+                "id": ev.get("id", ""),
+                "summary": ev.get("summary") or "(No Title)",
+                "start": (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date", ""),
+                "end": (ev.get("end") or {}).get("dateTime") or (ev.get("end") or {}).get("date", ""),
+            }
+            for ev in events
+        ]
+
     async def calendar_list_events(self, time_min: str, time_max: str) -> str:
         """List Google Calendar events in [time_min, time_max] ISO-8601 range."""
         async with self._create_client() as client:

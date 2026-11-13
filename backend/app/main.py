@@ -9,16 +9,36 @@ from fastapi import Depends, FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from app.agent.browser_ctrl import BrowserController
 from app.agent.consolidator import ConsolidationClientProtocol, GeminiConsolidationClient
 from app.agent.memory import MemoryService
 from app.agent.orchestrator import AgentOrchestrator, GoogleGenAIStreamProvider, LLMStreamProvider
-from app.api import approval, chat, jobs, mcp_admin, memory, sync
+from app.agent.proactive import ProactiveEngine
+from app.agent.voice_bridge import VoiceBridgeRegistry
+from app.api import (
+    approval,
+    browser,
+    chat,
+    jobs,
+    mcp_admin,
+    memory,
+    proactive,
+    sync,
+    voice_webhook,
+)
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging, get_logger, mask_secrets
 from app.core.security import ApprovalRequiredError, ApprovalService, verify_api_auth
 from app.db.session import create_engine_and_sessionmaker, init_db
 from app.sync.gemini_bridge import GeminiBridgeService
-from app.worker.tasks import build_mcp_hub, build_memory_service, register_settings_secrets
+from app.worker.tasks import (
+    build_browser_controller,
+    build_mcp_hub,
+    build_memory_service,
+    build_proactive_engine,
+    build_voice_bridge_registry,
+    register_settings_secrets,
+)
 
 logger = get_logger(__name__)
 
@@ -44,6 +64,9 @@ def create_app(
     llm_provider_override: LLMStreamProvider | None = None,
     memory_service_override: MemoryService | None = None,
     consolidation_client_override: ConsolidationClientProtocol | None = None,
+    browser_controller_override: BrowserController | None = None,
+    proactive_engine_override: ProactiveEngine | None = None,
+    voice_bridge_registry_override: VoiceBridgeRegistry | None = None,
     enable_redis: bool = True,
 ) -> FastAPI:
     """Build and configure the Gemuse FastAPI application."""
@@ -63,10 +86,35 @@ def create_app(
             settings.APPROVAL_HMAC_SECRET,
             default_ttl_seconds=settings.APPROVAL_TOKEN_TTL_SECONDS,
         )
+        arq_pool = None
+        if enable_redis:
+            try:
+                arq_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
+            except Exception as exc:
+                logger.warning(
+                    "Could not connect to Redis for ARQ pool; continuing without queue",
+                    extra={"error": mask_secrets(str(exc))},
+                )
+
+        browser_controller = browser_controller_override or build_browser_controller(
+            settings, redis_client=arq_pool
+        )
+        voice_bridge_registry = voice_bridge_registry_override or build_voice_bridge_registry(
+            settings
+        )
+        proactive_engine = proactive_engine_override or build_proactive_engine(
+            settings,
+            session_factory=db_session_factory,
+            redis_client=arq_pool,
+            memory_service=memory_service,
+        )
+
         mcp_hub, discord_connector = await build_mcp_hub(
             settings,
             approval_service=approval_service,
             session_factory=db_session_factory,
+            browser_controller=browser_controller,
+            voice_bridge_registry=voice_bridge_registry,
         )
 
         if llm_provider_override is not None:
@@ -99,16 +147,6 @@ def create_app(
             consolidation_client=consolidation_client,
         )
 
-        arq_pool = None
-        if enable_redis:
-            try:
-                arq_pool = await create_pool(RedisSettings.from_dsn(settings.REDIS_URL))
-            except Exception as exc:
-                logger.warning(
-                    "Could not connect to Redis for ARQ pool; continuing without queue",
-                    extra={"error": mask_secrets(str(exc))},
-                )
-
         app.state.settings = settings
         app.state.memory_service = memory_service
         app.state.approval_service = approval_service
@@ -117,6 +155,9 @@ def create_app(
         app.state.tool_registry = mcp_hub.tool_registry
         app.state.orchestrator = orchestrator
         app.state.gemini_bridge = gemini_bridge
+        app.state.browser_controller = browser_controller
+        app.state.proactive_engine = proactive_engine
+        app.state.voice_bridge_registry = voice_bridge_registry
         if not hasattr(app.state, "arq_pool") or app.state.arq_pool is None:
             app.state.arq_pool = arq_pool
 
@@ -132,7 +173,7 @@ def create_app(
 
     app = FastAPI(
         title=settings.APP_NAME,
-        version="0.2.0",
+        version="0.3.0",
         lifespan=lifespan,
     )
 
@@ -185,6 +226,10 @@ def create_app(
     app.include_router(approval.router, dependencies=auth_dep)
     app.include_router(mcp_admin.router, dependencies=auth_dep)
     app.include_router(sync.router)
+    app.include_router(browser.router, dependencies=auth_dep)
+    app.include_router(browser.ws_router)
+    app.include_router(proactive.router, dependencies=auth_dep)
+    app.include_router(voice_webhook.router)
 
     return app
 
