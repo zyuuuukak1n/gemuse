@@ -260,7 +260,7 @@ export function ChatWorkspace({
             message: text,
             conversation_id: activeConversationId,
             thinking_level: thinkingLevel,
-            mode: backgroundMode ? "background" : "foreground",
+            mode: backgroundMode ? "background" : "sse",
             attachments,
           }),
         });

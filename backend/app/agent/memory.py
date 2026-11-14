@@ -88,7 +88,7 @@ class EmbeddingProvider(ABC):
 class GeminiEmbeddingProvider(EmbeddingProvider):
     """Google GenAI embedding provider using official google-genai SDK."""
 
-    def __init__(self, api_key: str, model_name: str = "text-embedding-004") -> None:
+    def __init__(self, api_key: str, model_name: str = "gemini-embedding-001") -> None:
         self._client = genai.Client(api_key=api_key)
         self._model_name = model_name
 
@@ -96,6 +96,7 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         response = await self._client.aio.models.embed_content(
             model=self._model_name,
             contents=text,
+            config={"output_dimensionality": EMBEDDING_DIM},
         )
         embeddings = getattr(response, "embeddings", None)
         if not embeddings:
@@ -301,10 +302,11 @@ class MemoryService:
         bind = db.get_bind()
         dialect_name = bind.dialect.name if bind is not None else "sqlite"
 
-        if dialect_name == "postgresql":
+        if dialect_name == "postgresql" and hasattr(EpisodeMemory.embedding, "cosine_distance"):
             distance_expr = EpisodeMemory.embedding.cosine_distance(query_vec)
             stmt = (
                 select(EpisodeMemory, (1.0 - distance_expr).label("similarity"))
+                .where(EpisodeMemory.embedding.is_not(None))
                 .order_by(distance_expr.asc())
                 .limit(limit)
             )
@@ -315,12 +317,14 @@ class MemoryService:
                 if float(row[1]) >= min_sim
             ]
 
-        # SQLite / test fallback: compute exact cosine similarity in Python
+        # SQLite / non-pgvector column fallback: compute exact cosine similarity in Python
         stmt = select(EpisodeMemory).order_by(EpisodeMemory.created_at.desc())
         episodes = (await db.execute(stmt)).scalars().all()
         scored: list[EpisodeSearchResult] = []
         for ep in episodes:
-            sim = cosine_similarity(query_vec, ep.embedding)
+            if not ep.embedding:
+                continue
+            sim = cosine_similarity(query_vec, list(ep.embedding))
             if sim >= min_sim:
                 scored.append(EpisodeSearchResult(episode=ep, similarity=sim))
         scored.sort(key=lambda item: item.similarity, reverse=True)
@@ -414,4 +418,3 @@ class MemoryService:
             "episodes_text": "\n".join(episode_blocks) if episode_blocks else "(該当エピソードなし)",
             "skills_text": "\n\n".join(skill_blocks) if skill_blocks else "(該当スキルなし)",
         }
-
