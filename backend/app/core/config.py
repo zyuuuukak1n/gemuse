@@ -77,11 +77,14 @@ class Settings(BaseSettings):
     ICLOUD_SMTP_HOST: str = "smtp.mail.me.com"
     ICLOUD_SMTP_PORT: int = Field(default=587, ge=1, le=65535)
 
-    # Step 2: Google Workspace (Gmail / Calendar / Drive)
+    # Step 2+: Google Workspace (Gmail / Calendar / Drive / Docs / Sheets / Slides / Tasks / Contacts / Maps)
     GOOGLE_OAUTH_CLIENT_ID: str = ""
     GOOGLE_OAUTH_CLIENT_SECRET: str = ""
     GOOGLE_OAUTH_REFRESH_TOKEN: str = ""
     GOOGLE_CALENDAR_ID: str = "primary"
+    GOOGLE_OAUTH_REFRESH_TOKEN_SCHOOL: str = ""
+    GOOGLE_CALENDAR_ID_SCHOOL: str = "primary"
+    GOOGLE_MAPS_API_KEY: str = ""
 
     # Step 2: Social & Media (X / YouTube)
     X_BEARER_TOKEN: str = ""

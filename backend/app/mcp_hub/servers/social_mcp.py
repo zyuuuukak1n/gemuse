@@ -25,17 +25,38 @@ class SocialMediaMCPConnector(BaseMCPConnector):
         x_bearer_token: str = "",
         x_user_id: str = "",
         youtube_api_key: str = "",
+        youtube_oauth_refresh_token: str = "",
+        google_oauth_client_id: str = "",
+        google_oauth_client_secret: str = "",
+        google_oauth_refresh_token: str = "",
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
         transcript_fetcher: Callable[[str], list[dict[str, Any]]] | None = None,
     ) -> None:
         self._x_bearer_token = x_bearer_token.strip()
         self._x_user_id = x_user_id.strip()
         self._youtube_api_key = youtube_api_key.strip()
+        self._google_oauth_client_id = google_oauth_client_id.strip()
+        self._google_oauth_client_secret = google_oauth_client_secret.strip()
+        self._youtube_oauth_refresh_token = (
+            youtube_oauth_refresh_token.strip() or google_oauth_refresh_token.strip()
+        )
         self._http_client_factory = http_client_factory
         self._transcript_fetcher = transcript_fetcher
 
+    @property
+    def effective_youtube_refresh_token(self) -> str:
+        """Return configured YouTube refresh token with GOOGLE_OAUTH_REFRESH_TOKEN fallback."""
+        return self._youtube_oauth_refresh_token
+
+    def _has_youtube_oauth(self) -> bool:
+        return bool(
+            self._google_oauth_client_id
+            and self._google_oauth_client_secret
+            and self._youtube_oauth_refresh_token
+        )
+
     def is_configured(self) -> bool:
-        return bool(self._x_bearer_token or self._youtube_api_key)
+        return bool(self._x_bearer_token or self._youtube_api_key or self._has_youtube_oauth())
 
     def _create_client(self) -> httpx.AsyncClient:
         if self._http_client_factory is not None:
@@ -107,38 +128,92 @@ class SocialMediaMCPConnector(BaseMCPConnector):
         ]
         return wrap_untrusted_data(f"x:{mode}", "\n".join(lines))
 
+    async def _get_youtube_access_token(self, client: httpx.AsyncClient) -> str:
+        resp = await client.post(
+            "https://oauth2.googleapis.com/token",
+            data={
+                "client_id": self._google_oauth_client_id,
+                "client_secret": self._google_oauth_client_secret,
+                "refresh_token": self._youtube_oauth_refresh_token,
+                "grant_type": "refresh_token",
+            },
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+
     async def youtube_get_subscriptions_and_videos(
         self,
         query: str | None = None,
         limit: int = 10,
     ) -> str:
-        """Search YouTube videos or fetch popular/recent videos via YouTube Data API v3."""
-        if not self._youtube_api_key:
-            raise RuntimeError("YOUTUBE_API_KEY is not configured")
+        """Search YouTube videos or fetch user subscriptions via API key or OAuth2 fallback."""
+        has_oauth = self._has_youtube_oauth()
+        if not self._youtube_api_key and not has_oauth:
+            raise RuntimeError(
+                "YOUTUBE_API_KEY or YouTube/Google OAuth credentials are not configured"
+            )
 
         clamped = max(1, min(50, int(limit)))
-        params: dict[str, Any] = {
-            "part": "snippet",
-            "type": "video",
-            "maxResults": clamped,
-            "order": "date",
-            "key": self._youtube_api_key,
-        }
-        if query and query.strip():
-            params["q"] = query.strip()
+        clean_query = query.strip() if query and query.strip() else ""
 
         async with self._create_client() as client:
-            resp = await client.get(
-                "https://www.googleapis.com/youtube/v3/search",
-                params=params,
-            )
+            if has_oauth and (not clean_query or not self._youtube_api_key):
+                token = await self._get_youtube_access_token(client)
+                headers = {"Authorization": f"Bearer {token}"}
+                if not clean_query:
+                    resp = await client.get(
+                        "https://www.googleapis.com/youtube/v3/subscriptions",
+                        headers=headers,
+                        params={"part": "snippet", "mine": "true", "maxResults": clamped},
+                    )
+                    resp.raise_for_status()
+                    items = resp.json().get("items") or []
+                    if not items:
+                        return wrap_untrusted_data(
+                            "youtube:subscriptions", "登録チャンネルが見つかりませんでした。"
+                        )
+                    lines = []
+                    for item in items:
+                        snippet = item.get("snippet") or {}
+                        ch_id = (snippet.get("resourceId") or {}).get("channelId", "")
+                        lines.append(
+                            f"- [MCP: youtube] {snippet.get('title', '')} (channel_id={ch_id}, published={snippet.get('publishedAt', '')})"
+                        )
+                    return wrap_untrusted_data("youtube:subscriptions", "\n".join(lines))
+
+                resp = await client.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    headers=headers,
+                    params={
+                        "part": "snippet",
+                        "type": "video",
+                        "maxResults": clamped,
+                        "order": "date",
+                        "q": clean_query,
+                    },
+                )
+            else:
+                params: dict[str, Any] = {
+                    "part": "snippet",
+                    "type": "video",
+                    "maxResults": clamped,
+                    "order": "date",
+                    "key": self._youtube_api_key,
+                }
+                if clean_query:
+                    params["q"] = clean_query
+                resp = await client.get(
+                    "https://www.googleapis.com/youtube/v3/search",
+                    params=params,
+                )
+
             resp.raise_for_status()
             items = resp.json().get("items") or []
 
         if not items:
             return wrap_untrusted_data("youtube:videos", "動画が見つかりませんでした。")
 
-        lines: list[str] = []
+        lines = []
         for item in items:
             vid = (item.get("id") or {}).get("videoId", "")
             snippet = item.get("snippet") or {}
@@ -203,19 +278,23 @@ class SocialMediaMCPConnector(BaseMCPConnector):
                     already_wrapped=True,
                 )
             )
-        if self._youtube_api_key:
+        if self._youtube_api_key or self._has_youtube_oauth():
             tools.append(
                 MCPTool(
                     name="youtube_get_subscriptions_and_videos",
-                    description="Search or list recent YouTube videos.",
+                    description="Search or list recent YouTube videos and subscriptions.",
                     handler=self.youtube_get_subscriptions_and_videos,
                     requires_approval=False,
                     source_type="youtube",
                     already_wrapped=True,
                 )
             )
-        # Transcript extraction works via video_id even with youtube_api_key alone (or standalone)
-        if self._youtube_api_key or self._transcript_fetcher is not None:
+        # Transcript extraction works via video_id with YouTube credentials or standalone fetcher
+        if (
+            self._youtube_api_key
+            or self._has_youtube_oauth()
+            or self._transcript_fetcher is not None
+        ):
             tools.append(
                 MCPTool(
                     name="youtube_get_transcript",

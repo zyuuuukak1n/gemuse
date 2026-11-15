@@ -61,6 +61,8 @@ def register_settings_secrets(settings: Settings) -> None:
         settings.ICLOUD_APP_PASSWORD,
         settings.GOOGLE_OAUTH_CLIENT_SECRET,
         settings.GOOGLE_OAUTH_REFRESH_TOKEN,
+        settings.GOOGLE_OAUTH_REFRESH_TOKEN_SCHOOL,
+        settings.GOOGLE_MAPS_API_KEY,
         settings.X_BEARER_TOKEN,
         settings.YOUTUBE_API_KEY,
         settings.YOUTUBE_OAUTH_REFRESH_TOKEN,
@@ -133,26 +135,27 @@ def build_voice_bridge_registry(settings: Settings) -> VoiceBridgeRegistry:
     )
 
 
-def build_proactive_engine(
+def _build_google_connector(
     settings: Settings,
     *,
+    approval_service: ApprovalService,
     session_factory: async_sessionmaker[AsyncSession] | None = None,
-    redis_client: Redis | None = None,
-    memory_service: MemoryService | None = None,
-) -> ProactiveEngine:
-    """Construct ProactiveEngine with graceful connector-backed calendar & mail fetchers."""
-    google_client = GoogleWorkspaceMCPConnector(
+) -> GoogleWorkspaceMCPConnector:
+    return GoogleWorkspaceMCPConnector(
         client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
         client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
         refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN,
         calendar_id=settings.GOOGLE_CALENDAR_ID,
-        approval_service=ApprovalService(
-            settings.APPROVAL_HMAC_SECRET,
-            default_ttl_seconds=settings.APPROVAL_TOKEN_TTL_SECONDS,
-        ),
+        refresh_token_school=settings.GOOGLE_OAUTH_REFRESH_TOKEN_SCHOOL,
+        calendar_id_school=settings.GOOGLE_CALENDAR_ID_SCHOOL,
+        maps_api_key=settings.GOOGLE_MAPS_API_KEY,
+        approval_service=approval_service,
         session_factory=session_factory,
     )
-    mail_clients = {
+
+
+def _build_mail_clients(settings: Settings) -> dict[Any, Any]:
+    clients: dict[Any, Any] = {
         "outlook": OutlookMailClient(
             client_id=settings.OUTLOOK_CLIENT_ID,
             client_secret=settings.OUTLOOK_CLIENT_SECRET,
@@ -171,11 +174,39 @@ def build_proactive_engine(
             client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
             client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
             refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN,
+            provider_name="gmail",
         ),
     }
+    if settings.GOOGLE_OAUTH_REFRESH_TOKEN_SCHOOL.strip():
+        clients["gmail_school"] = GmailMailClient(
+            client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
+            client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
+            refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN_SCHOOL,
+            provider_name="gmail_school",
+        )
+    return clients
+
+
+def build_proactive_engine(
+    settings: Settings,
+    *,
+    session_factory: async_sessionmaker[AsyncSession] | None = None,
+    redis_client: Redis | None = None,
+    memory_service: MemoryService | None = None,
+) -> ProactiveEngine:
+    """Construct ProactiveEngine with graceful connector-backed calendar & mail fetchers."""
+    google_client = _build_google_connector(
+        settings,
+        approval_service=ApprovalService(
+            settings.APPROVAL_HMAC_SECRET,
+            default_ttl_seconds=settings.APPROVAL_TOKEN_TTL_SECONDS,
+        ),
+        session_factory=session_factory,
+    )
+    mail_clients = _build_mail_clients(settings)
 
     async def _fetch_calendar(start: datetime, end: datetime) -> list[dict[str, Any]]:
-        if not google_client.is_configured():
+        if not google_client.has_oauth_configured():
             return []
         try:
             return await google_client.list_events_structured(
@@ -247,35 +278,12 @@ async def build_mcp_hub(
         api_base_url=settings.DISCORD_API_BASE_URL,
     )
     mail_connector = MailMCPConnector(
-        providers={
-            "outlook": OutlookMailClient(
-                client_id=settings.OUTLOOK_CLIENT_ID,
-                client_secret=settings.OUTLOOK_CLIENT_SECRET,
-                tenant_id=settings.OUTLOOK_TENANT_ID,
-                refresh_token=settings.OUTLOOK_REFRESH_TOKEN,
-            ),
-            "icloud": ICloudMailClient(
-                email_address=settings.ICLOUD_EMAIL,
-                app_password=settings.ICLOUD_APP_PASSWORD,
-                imap_host=settings.ICLOUD_IMAP_HOST,
-                imap_port=settings.ICLOUD_IMAP_PORT,
-                smtp_host=settings.ICLOUD_SMTP_HOST,
-                smtp_port=settings.ICLOUD_SMTP_PORT,
-            ),
-            "gmail": GmailMailClient(
-                client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
-                client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
-                refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN,
-            ),
-        },
+        providers=_build_mail_clients(settings),
         approval_service=approval_service,
         session_factory=session_factory,
     )
-    google_connector = GoogleWorkspaceMCPConnector(
-        client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
-        client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
-        refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN,
-        calendar_id=settings.GOOGLE_CALENDAR_ID,
+    google_connector = _build_google_connector(
+        settings,
         approval_service=approval_service,
         session_factory=session_factory,
     )
@@ -283,6 +291,10 @@ async def build_mcp_hub(
         x_bearer_token=settings.X_BEARER_TOKEN,
         x_user_id=settings.X_USER_ID,
         youtube_api_key=settings.YOUTUBE_API_KEY,
+        youtube_oauth_refresh_token=settings.YOUTUBE_OAUTH_REFRESH_TOKEN,
+        google_oauth_client_id=settings.GOOGLE_OAUTH_CLIENT_ID,
+        google_oauth_client_secret=settings.GOOGLE_OAUTH_CLIENT_SECRET,
+        google_oauth_refresh_token=settings.GOOGLE_OAUTH_REFRESH_TOKEN,
     )
     active_browser_ctrl = browser_controller or build_browser_controller(settings)
     browser_connector = BrowserMCPConnector(

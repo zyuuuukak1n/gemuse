@@ -22,7 +22,7 @@ from app.mcp_hub.base import BaseMCPConnector, MCPTool
 
 logger = get_logger(__name__)
 
-MailProviderName = Literal["outlook", "icloud", "gmail"]
+MailProviderName = Literal["outlook", "icloud", "gmail", "gmail_school"]
 
 
 class UnifiedEmail(BaseModel):
@@ -350,9 +350,7 @@ class ICloudMailClient:
 
 
 class GmailMailClient:
-    """Google Gmail REST API client using OAuth2 refresh token."""
-
-    provider_name: MailProviderName = "gmail"
+    """Google Gmail REST API client using OAuth2 refresh token (private or school)."""
 
     def __init__(
         self,
@@ -360,8 +358,10 @@ class GmailMailClient:
         client_id: str,
         client_secret: str,
         refresh_token: str,
+        provider_name: MailProviderName = "gmail",
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     ) -> None:
+        self.provider_name: MailProviderName = provider_name
         self._client_id = client_id.strip()
         self._client_secret = client_secret.strip()
         self._refresh_token = refresh_token.strip()
@@ -389,7 +389,10 @@ class GmailMailClient:
         return resp.json()["access_token"]
 
     @staticmethod
-    def _parse_gmail_message(data: dict[str, Any]) -> UnifiedEmail:
+    def _parse_gmail_message(
+        data: dict[str, Any],
+        provider_name: MailProviderName = "gmail",
+    ) -> UnifiedEmail:
         payload = data.get("payload") or {}
         headers = {
             h.get("name", "").lower(): h.get("value", "")
@@ -409,7 +412,7 @@ class GmailMailClient:
                 "utf-8", errors="replace"
             )
         return UnifiedEmail(
-            provider="gmail",
+            provider=provider_name,
             message_id=str(data.get("id", "")),
             subject=headers.get("subject") or "(No Subject)",
             sender=headers.get("from", ""),
@@ -438,7 +441,7 @@ class GmailMailClient:
                     headers=auth_headers,
                 )
                 r.raise_for_status()
-                return self._parse_gmail_message(r.json())
+                return self._parse_gmail_message(r.json(), self.provider_name)
 
             fetched = await asyncio.gather(
                 *(_fetch_msg(ref["id"]) for ref in refs if ref.get("id")),
@@ -454,7 +457,7 @@ class GmailMailClient:
                 headers={"Authorization": f"Bearer {token}"},
             )
             resp.raise_for_status()
-            return self._parse_gmail_message(resp.json())
+            return self._parse_gmail_message(resp.json(), self.provider_name)
 
     @staticmethod
     def _encode_raw_message(to: str, subject: str, body: str) -> str:
@@ -475,7 +478,11 @@ class GmailMailClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            return {"provider": "gmail", "draft_id": data.get("id", ""), "status": "draft_created"}
+            return {
+                "provider": self.provider_name,
+                "draft_id": data.get("id", ""),
+                "status": "draft_created",
+            }
 
     async def send_email(self, to: str, subject: str, body: str) -> dict[str, Any]:
         raw = self._encode_raw_message(to, subject, body)
@@ -488,7 +495,11 @@ class GmailMailClient:
             )
             resp.raise_for_status()
             data = resp.json()
-            return {"provider": "gmail", "message_id": data.get("id", ""), "status": "sent"}
+            return {
+                "provider": self.provider_name,
+                "message_id": data.get("id", ""),
+                "status": "sent",
+            }
 
 
 class MailMCPConnector(BaseMCPConnector):
@@ -512,6 +523,10 @@ class MailMCPConnector(BaseMCPConnector):
 
     def _get_active_provider(self, provider: str) -> MailProviderClient:
         key = provider.lower().strip()
+        if key in ("", "private"):
+            key = "gmail"
+        elif key == "school":
+            key = "gmail_school"
         if key not in self._providers:
             raise ValueError(f"Unknown mail provider '{provider}'")
         client = self._providers[key]  # type: ignore[index]
@@ -580,21 +595,30 @@ class MailMCPConnector(BaseMCPConnector):
         email_item = await client.get_detail(message_id)
         return self._wrap_email(email_item)
 
-    async def mail_create_draft(self, provider: str, to: str, subject: str, body: str) -> str:
-        """Create an email draft safely (no approval required)."""
-        client = self._get_active_provider(provider)
+    async def mail_create_draft(
+        self,
+        provider: str = "gmail",
+        to: str = "",
+        subject: str = "",
+        body: str = "",
+    ) -> str:
+        """Create an email draft safely (no approval required; defaults to private 'gmail')."""
+        if not to.strip():
+            raise ValueError("Recipient email address `to` is required")
+        resolved_provider = provider.strip() or "gmail"
+        client = self._get_active_provider(resolved_provider)
         result = await client.create_draft(to=to, subject=subject, body=body)
-        return wrap_untrusted_data(f"email:{provider}:draft", str(result))
+        return wrap_untrusted_data(f"email:{client.provider_name}:draft", str(result))
 
     async def mail_send_email(
         self,
-        provider: str,
-        to: str,
-        subject: str,
-        body: str,
+        provider: str = "gmail",
+        to: str = "",
+        subject: str = "",
+        body: str = "",
         approval_token: str = "",
     ) -> str:
-        """Send an email after verifying and consuming a one-time approval_token."""
+        """Send an email after verifying one-time approval_token (defaults to private 'gmail')."""
         if self._session_factory is None:
             raise ApprovalRequiredError(
                 "Cannot verify approval_token for mail_send_email without DB session",
@@ -607,9 +631,12 @@ class MailMCPConnector(BaseMCPConnector):
                 raw_token=approval_token,
             )
 
-        client = self._get_active_provider(provider)
+        if not to.strip():
+            raise ValueError("Recipient email address `to` is required")
+        resolved_provider = provider.strip() or "gmail"
+        client = self._get_active_provider(resolved_provider)
         result = await client.send_email(to=to, subject=subject, body=body)
-        return wrap_untrusted_data(f"email:{provider}:sent", str(result))
+        return wrap_untrusted_data(f"email:{client.provider_name}:sent", str(result))
 
     def get_tools(self) -> list[MCPTool]:
         return [

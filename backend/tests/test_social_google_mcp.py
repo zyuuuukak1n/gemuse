@@ -187,3 +187,539 @@ async def test_social_x_rate_limit_and_youtube_transcript() -> None:
     assert "[0.0s]" in transcript
     assert "<untrusted_external_data" in transcript
 
+
+
+async def test_google_dual_account_parallel_read_and_default_private_protection(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    token_requests: list[str] = []
+    created_calendars: list[tuple[str, str]] = []
+    drive_ops: list[tuple[str, str, str]] = []
+
+    def _account_from_auth(request: httpx.Request) -> str:
+        auth = request.headers.get("Authorization", "")
+        if "school-access" in auth:
+            return "school"
+        return "private"
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "oauth2.googleapis.com/token" in url:
+            body = request.content.decode("utf-8")
+            if "refresh-school" in body:
+                token_requests.append("school")
+                return httpx.Response(200, json={"access_token": "school-access"})
+            token_requests.append("private")
+            return httpx.Response(200, json={"access_token": "private-access"})
+
+        acct = _account_from_auth(request)
+        if "/calendar/v3/calendars/" in url and request.method == "GET":
+            if acct == "school":
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {
+                                "id": "sch-1",
+                                "summary": "AI Lecture",
+                                "start": {"dateTime": "2026-11-16T09:00:00+09:00"},
+                                "end": {"dateTime": "2026-11-16T10:30:00+09:00"},
+                            }
+                        ]
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "items": [
+                        {
+                            "id": "priv-1",
+                            "summary": "Dentist",
+                            "start": {"dateTime": "2026-11-16T14:00:00+09:00"},
+                            "end": {"dateTime": "2026-11-16T15:00:00+09:00"},
+                        }
+                    ]
+                },
+            )
+        if "/calendar/v3/calendars/" in url and request.method == "POST":
+            created_calendars.append((acct, url))
+            body = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(200, json={"id": f"{acct}-new", "summary": body["summary"]})
+        if "/calendar/v3/calendars/" in url and request.method == "PATCH":
+            body = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(200, json={"id": "sch-1", "summary": body.get("summary", "")})
+        if "/calendar/v3/calendars/" in url and request.method == "DELETE":
+            return httpx.Response(204)
+
+        if "/drive/v3/files" in url and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "files": [
+                        {
+                            "id": f"{acct}-f1",
+                            "name": f"{acct}-Notes.txt",
+                            "mimeType": "text/plain",
+                            "modifiedTime": "2026-11-15T01:00:00Z",
+                        }
+                    ]
+                },
+            )
+        if "/drive/v3/files" in url and request.method == "POST":
+            body = json.loads(request.content.decode("utf-8"))
+            drive_ops.append(("create_folder", acct, body["name"]))
+            return httpx.Response(200, json={"id": "fld-1", "name": body["name"]})
+        if "/drive/v3/files/" in url and request.method == "PATCH":
+            body = json.loads(request.content.decode("utf-8"))
+            drive_ops.append(("move_or_rename", acct, body.get("name", "")))
+            return httpx.Response(200, json={"id": "f-1", "name": body.get("name", "Renamed")})
+
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    connector = GoogleWorkspaceMCPConnector(
+        client_id="gid",
+        client_secret="gsecret",
+        refresh_token="refresh-private",
+        calendar_id="primary",
+        refresh_token_school="refresh-school",
+        calendar_id_school="school-cal@group.calendar.google.com",
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(transport=transport),
+    )
+
+    # 1. Parallel Calendar listing merges & sorts school + private with labels
+    cal_out = await connector.calendar_list_events(
+        "2026-11-16T00:00:00+09:00",
+        "2026-11-16T23:59:59+09:00",
+    )
+    assert "[school] [MCP: calendar]" in cal_out
+    assert "[private] [MCP: calendar]" in cal_out
+    assert "AI Lecture" in cal_out and "Dentist" in cal_out
+    assert cal_out.index("AI Lecture") < cal_out.index("Dentist")
+
+    structured = await connector.list_events_structured(
+        "2026-11-16T00:00:00+09:00",
+        "2026-11-16T23:59:59+09:00",
+    )
+    assert [ev["account"] for ev in structured] == ["school", "private"]
+
+    # 2. Drive search across both accounts
+    drive_out = await connector.drive_search_files("Notes")
+    assert "[private] [MCP: drive] private-Notes.txt" in drive_out
+    assert "[school] [MCP: drive] school-Notes.txt" in drive_out
+
+    # 3. Creation defaults strictly to private account
+    async with db_session_factory() as db:
+        req, tok_create = await approval.create_request(
+            db, action_type="calendar_create_event", payload={"summary": "Private Dinner"}
+        )
+        await approval.resolve_request(db, approval_id=req.id, decision="approved", raw_token=tok_create)
+        req_upd, tok_upd = await approval.create_request(
+            db, action_type="calendar_update_event", payload={"event_id": "sch-1"}
+        )
+        await approval.resolve_request(db, approval_id=req_upd.id, decision="approved", raw_token=tok_upd)
+        req_del, tok_del = await approval.create_request(
+            db, action_type="calendar_delete_event", payload={"event_id": "sch-1"}
+        )
+        await approval.resolve_request(db, approval_id=req_del.id, decision="approved", raw_token=tok_del)
+
+    created = await connector.calendar_create_event(
+        summary="Private Dinner",
+        start_time="2026-11-16T19:00:00+09:00",
+        end_time="2026-11-16T20:00:00+09:00",
+        approval_token=tok_create,
+    )
+    assert '"account": "private"' in created
+    assert created_calendars[-1][0] == "private"
+
+    # Explicit school update/delete still gated by ApprovalRequiredError
+    with pytest.raises(ApprovalRequiredError):
+        await connector.calendar_update_event(event_id="sch-1", summary="Bad", approval_token="")
+
+    upd_out = await connector.calendar_update_event(
+        event_id="sch-1", summary="Updated Lecture", approval_token=tok_upd, account="school"
+    )
+    assert '"status": "updated"' in upd_out
+    assert '"account": "school"' in upd_out
+
+    del_out = await connector.calendar_delete_event(
+        event_id="sch-1", approval_token=tok_del, account="school"
+    )
+    assert '"status": "deleted"' in del_out
+
+    fld_out = await connector.drive_create_folder("Research")
+    assert '"account": "private"' in fld_out
+    assert drive_ops[0] == ("create_folder", "private", "Research")
+
+    move_out = await connector.drive_move_or_rename("f-1", new_name="Syllabus", account="school")
+    assert '"account": "school"' in move_out
+    assert drive_ops[1] == ("move_or_rename", "school", "Syllabus")
+
+
+async def test_google_docs_sheets_slides_tasks_contacts_and_maps(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    calls: list[tuple[str, str, dict]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "oauth2.googleapis.com/token" in url:
+            body = request.content.decode("utf-8")
+            tok = "school-access" if "refresh-school" in body else "private-access"
+            return httpx.Response(200, json={"access_token": tok})
+
+        auth = request.headers.get("Authorization", "")
+        acct = "school" if "school-access" in auth else "private"
+        payload = json.loads(request.content.decode("utf-8")) if request.content else {}
+        calls.append((request.method, url, payload))
+
+        # Docs API v1
+        if url == "https://docs.googleapis.com/v1/documents" and request.method == "POST":
+            return httpx.Response(200, json={"documentId": "doc-1", "title": payload["title"]})
+        if url == "https://docs.googleapis.com/v1/documents/doc-1:batchUpdate":
+            return httpx.Response(
+                200,
+                json={"documentId": "doc-1", "replies": [{"replaceAllText": {"occurrencesChanged": 2}}]},
+            )
+        if url == "https://docs.googleapis.com/v1/documents/doc-1" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "documentId": "doc-1",
+                    "title": "Lab Report",
+                    "revisionId": "rev-9",
+                    "body": {
+                        "content": [
+                            {"paragraph": {"elements": [{"textRun": {"content": "Intro line\n"}}]}},
+                            {
+                                "table": {
+                                    "tableRows": [
+                                        {
+                                            "tableCells": [
+                                                {"content": [{"paragraph": {"elements": [{"textRun": {"content": "ColA"}}]}}]},
+                                                {"content": [{"paragraph": {"elements": [{"textRun": {"content": "ValB"}}]}}]},
+                                            ]
+                                        }
+                                    ]
+                                }
+                            },
+                        ]
+                    },
+                },
+            )
+
+        # Sheets API v4
+        if url == "https://sheets.googleapis.com/v4/spreadsheets" and request.method == "POST":
+            return httpx.Response(200, json={"spreadsheetId": "sh-1", "properties": payload["properties"]})
+        if "sheets.googleapis.com/v4/spreadsheets/sh-1/values/" in url:
+            if ":append" in url:
+                return httpx.Response(
+                    200,
+                    json={
+                        "spreadsheetId": "sh-1",
+                        "updates": {"updatedRange": "Grades!A3:B3", "updatedRows": 1},
+                    },
+                )
+            if request.method == "PUT":
+                return httpx.Response(
+                    200,
+                    json={"spreadsheetId": "sh-1", "updatedRange": "Grades!A1:B2", "updatedCells": 4},
+                )
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={"range": "Grades!A1:B2", "values": [["Name", "Score"], ["Taro", "95"]]},
+                )
+
+        # Slides API v1
+        if url == "https://slides.googleapis.com/v1/presentations" and request.method == "POST":
+            return httpx.Response(200, json={"presentationId": "sl-1", "title": payload["title"]})
+        if url == "https://slides.googleapis.com/v1/presentations/sl-1:batchUpdate":
+            return httpx.Response(200, json={"presentationId": "sl-1", "replies": []})
+        if url == "https://slides.googleapis.com/v1/presentations/sl-1" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "presentationId": "sl-1",
+                    "title": "Seminar Deck",
+                    "slides": [
+                        {
+                            "objectId": "p1",
+                            "pageElements": [
+                                {
+                                    "shape": {
+                                        "text": {"textElements": [{"textRun": {"content": "Overview"}}]}
+                                    }
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        # Tasks API v1
+        if "tasks.googleapis.com/tasks/v1/lists/" in url:
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json={
+                        "items": [
+                            {"id": f"{acct}-t1", "title": f"{acct} task", "status": "needsAction", "due": "2026-11-20T00:00:00Z"}
+                        ]
+                    },
+                )
+            if request.method == "POST":
+                return httpx.Response(200, json={"id": "t-new", "title": payload["title"]})
+            if request.method == "PATCH":
+                return httpx.Response(200, json={"id": "t-new", "status": "completed"})
+
+        # People API v1
+        if "people.googleapis.com/v1/people:searchContacts" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "person": {
+                                "names": [{"displayName": f"Prof. {acct}"}],
+                                "emailAddresses": [{"value": f"{acct}@example.edu"}],
+                                "phoneNumbers": [{"value": "+81312345678"}],
+                            }
+                        }
+                    ]
+                },
+            )
+
+        # Maps APIs (Places New & Routes)
+        if url == "https://places.googleapis.com/v1/places:searchText":
+            assert request.headers.get("X-Goog-Api-Key") == "maps-key-test"
+            return httpx.Response(
+                200,
+                json={
+                    "places": [
+                        {
+                            "id": "plc-1",
+                            "displayName": {"text": "Tokyo University Library"},
+                            "formattedAddress": "Tokyo, Japan",
+                            "rating": 4.8,
+                            "googleMapsUri": "https://maps.google.com/?cid=1",
+                        }
+                    ]
+                },
+            )
+        if url == "https://routes.googleapis.com/directions/v2:computeRoutes":
+            assert request.headers.get("X-Goog-Api-Key") == "maps-key-test"
+            return httpx.Response(
+                200,
+                json={
+                    "routes": [
+                        {
+                            "distanceMeters": 5400,
+                            "duration": "1080s",
+                            "localizedValues": {"distance": {"text": "5.4 km"}, "duration": {"text": "18 mins"}},
+                        }
+                    ]
+                },
+            )
+
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    connector = GoogleWorkspaceMCPConnector(
+        client_id="gid",
+        client_secret="gsecret",
+        refresh_token="refresh-private",
+        refresh_token_school="refresh-school",
+        maps_api_key="maps-key-test",
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(transport=transport),
+    )
+
+    tool_names = {t.name for t in connector.get_tools()}
+    assert {
+        "calendar_list_events",
+        "calendar_check_conflicts",
+        "calendar_create_event",
+        "calendar_update_event",
+        "calendar_delete_event",
+        "drive_search_files",
+        "drive_read_text_file",
+        "drive_create_folder",
+        "drive_move_or_rename",
+        "docs_create_document",
+        "docs_get_document",
+        "docs_append_text",
+        "docs_replace_text",
+        "sheets_create_spreadsheet",
+        "sheets_read_range",
+        "sheets_append_rows",
+        "sheets_update_values",
+        "slides_create_presentation",
+        "slides_get_presentation",
+        "slides_add_slide",
+        "tasks_list",
+        "tasks_create",
+        "tasks_complete",
+        "contacts_search",
+        "maps_search_places",
+        "maps_compute_route",
+    }.issubset(tool_names)
+
+    # Docs lifecycle (default private)
+    doc_create = await connector.docs_create_document("Lab Report", initial_text="Intro line\n")
+    assert '"document_id": "doc-1"' in doc_create
+    assert '"account": "private"' in doc_create
+    doc_get = await connector.docs_get_document("doc-1")
+    assert "[MCP: docs]" in doc_get
+    assert "ColA | ValB" in doc_get
+    assert '"status": "appended"' in await connector.docs_append_text("doc-1", "More")
+    rep_out = await connector.docs_replace_text("doc-1", "Intro", "Summary")
+    assert '"occurrences_changed": 2' in rep_out
+
+    # Sheets lifecycle
+    sh_create = await connector.sheets_create_spreadsheet(
+        "Scores", sheet_name="Grades", initial_rows=[["Name", "Score"], ["Taro", 95]]
+    )
+    assert '"spreadsheet_id": "sh-1"' in sh_create
+    assert '"updated_cells": 4' in sh_create
+    assert '"Taro"' in await connector.sheets_read_range("sh-1", "Grades!A1:B2")
+    assert '"updated_rows": 1' in await connector.sheets_append_rows("sh-1", "Grades!A1:B2", [["Hanako", 98]])
+    assert '"status": "updated"' in await connector.sheets_update_values("sh-1", "Grades!A1:B2", [["A", "B"]])
+
+    # Slides lifecycle
+    sl_create = await connector.slides_create_presentation(
+        "Seminar Deck", initial_slide_title="Agenda", initial_slide_body="1. Intro"
+    )
+    assert '"presentation_id": "sl-1"' in sl_create
+    assert "Overview" in await connector.slides_get_presentation("sl-1")
+    assert '"status": "slide_added"' in await connector.slides_add_slide("sl-1", title="Next", body="Details")
+
+    # Tasks & Contacts across both accounts
+    tasks_out = await connector.tasks_list()
+    assert "[private] [MCP: tasks]" in tasks_out
+    assert "[school] [MCP: tasks]" in tasks_out
+    assert '"account": "private"' in await connector.tasks_create("Submit assignment")
+    assert '"status": "completed"' in await connector.tasks_complete("t-new", account="school")
+
+    contacts_out = await connector.contacts_search("Prof")
+    assert "[private] [MCP: contacts] Prof. private" in contacts_out
+    assert "[school] [MCP: contacts] Prof. school" in contacts_out
+
+    # Maps Places & Routes
+    places_out = await connector.maps_search_places("Tokyo University Library")
+    assert "[MCP: maps] Tokyo University Library" in places_out
+    route_out = await connector.maps_compute_route("Shinjuku", "Tokyo University", travel_mode="TRANSIT")
+    assert '"distance_meters": 5400' in route_out
+    assert '"duration": "1080s"' in route_out
+
+
+async def test_gmail_school_dual_account_and_youtube_oauth_fallback(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    from app.core.config import Settings
+    from app.mcp_hub.servers.mail_mcp import GmailMailClient, MailMCPConnector
+    from app.worker.tasks import build_mcp_hub
+
+    def _gmail_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        path = request.url.path
+        if "oauth2.googleapis.com/token" in url:
+            tok = "school-tok" if "school-refresh" in request.content.decode("utf-8") else "priv-tok"
+            return httpx.Response(200, json={"access_token": tok})
+        acct = "school" if "school-tok" in request.headers.get("Authorization", "") else "priv"
+        if path.endswith("/messages"):
+            return httpx.Response(200, json={"messages": [{"id": f"{acct}-m1"}]})
+        if "/messages/" in path and not path.endswith("/messages/send") and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"{acct}-m1",
+                    "threadId": "th-1",
+                    "snippet": f"{acct} syllabus",
+                    "internalDate": "1763200000000" if acct == "school" else "1763100000000",
+                    "payload": {
+                        "headers": [
+                            {"name": "Subject", "value": f"[{acct}] Important Notice"},
+                            {"name": "From", "value": f"{acct}@example.com"},
+                        ]
+                    },
+                },
+            )
+        if path.endswith("/drafts") and request.method == "POST":
+            return httpx.Response(200, json={"id": f"{acct}-draft-1"})
+        if path.endswith("/messages/send") and request.method == "POST":
+            return httpx.Response(200, json={"id": f"{acct}-sent-1"})
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_gmail_handler)
+    priv_client = GmailMailClient(
+        client_id="gid",
+        client_secret="gsec",
+        refresh_token="priv-refresh",
+        provider_name="gmail",
+        http_client_factory=lambda: httpx.AsyncClient(transport=transport),
+    )
+    school_client = GmailMailClient(
+        client_id="gid",
+        client_secret="gsec",
+        refresh_token="school-refresh",
+        provider_name="gmail_school",
+        http_client_factory=lambda: httpx.AsyncClient(transport=transport),
+    )
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    mail_conn = MailMCPConnector(
+        providers={"gmail": priv_client, "gmail_school": school_client},
+        approval_service=approval,
+        session_factory=db_session_factory,
+    )
+
+    merged_out = await mail_conn.mail_search_all("Important")
+    assert "[Email: gmail / priv-m1]" in merged_out
+    assert "[Email: gmail_school / school-m1]" in merged_out
+
+    # Default draft targets private gmail
+    default_draft = await mail_conn.mail_create_draft(
+        to="friend@example.com", subject="Hi", body="Hello"
+    )
+    assert "'provider': 'gmail'" in default_draft
+
+    # School draft targets gmail_school when explicitly specified
+    school_draft = await mail_conn.mail_create_draft(
+        provider="gmail_school", to="prof@example.edu", subject="Question", body="Dear Prof"
+    )
+    assert "'provider': 'gmail_school'" in school_draft
+
+    # YouTube OAuth fallback to GOOGLE_OAUTH_REFRESH_TOKEN + build_mcp_hub dual registration
+    settings = Settings(
+        APP_ENV="test",
+        API_SECRET_TOKEN="test-secret-token-0123456789",
+        APPROVAL_HMAC_SECRET=TEST_HMAC_SECRET,
+        DATABASE_URL="sqlite+aiosqlite:///:memory:",
+        REDIS_URL="redis://localhost:6379/0",
+        GOOGLE_OAUTH_CLIENT_ID="gid",
+        GOOGLE_OAUTH_CLIENT_SECRET="gsec",
+        GOOGLE_OAUTH_REFRESH_TOKEN="priv-google-refresh",
+        GOOGLE_OAUTH_REFRESH_TOKEN_SCHOOL="school-google-refresh",
+        GOOGLE_MAPS_API_KEY="maps-key-test",
+        YOUTUBE_OAUTH_REFRESH_TOKEN="",
+    )
+    hub, _ = await build_mcp_hub(
+        settings,
+        approval_service=approval,
+        session_factory=db_session_factory,
+        load_external=False,
+    )
+    registered_tools = {t.name for t in hub.list_all_tools()}
+    assert "docs_create_document" in registered_tools
+    assert "maps_compute_route" in registered_tools
+    assert "youtube_get_subscriptions_and_videos" in registered_tools
+
+    social_connector = next(c for c in hub._connectors if c.connector_name == "social_media")
+    assert social_connector.effective_youtube_refresh_token == "priv-google-refresh"  # type: ignore[attr-defined]
+    mail_connector = next(c for c in hub._connectors if c.connector_name == "mail")
+    assert "gmail_school" in mail_connector._providers  # type: ignore[attr-defined]
