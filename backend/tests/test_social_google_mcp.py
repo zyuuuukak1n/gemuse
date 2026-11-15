@@ -295,8 +295,9 @@ async def test_google_dual_account_parallel_read_and_default_private_protection(
         "2026-11-16T00:00:00+09:00",
         "2026-11-16T23:59:59+09:00",
     )
-    assert "[school] [MCP: calendar]" in cal_out
-    assert "[private] [MCP: calendar]" in cal_out
+    assert "[school /" in cal_out
+    assert "[private /" in cal_out
+    assert "[MCP: calendar]" in cal_out
     assert "AI Lecture" in cal_out and "Dentist" in cal_out
     assert cal_out.index("AI Lecture") < cal_out.index("Dentist")
 
@@ -542,6 +543,7 @@ async def test_google_docs_sheets_slides_tasks_contacts_and_maps(
 
     tool_names = {t.name for t in connector.get_tools()}
     assert {
+        "calendar_list_calendars",
         "calendar_list_events",
         "calendar_check_conflicts",
         "calendar_create_event",
@@ -723,3 +725,211 @@ async def test_gmail_school_dual_account_and_youtube_oauth_fallback(
     assert social_connector.effective_youtube_refresh_token == "priv-google-refresh"  # type: ignore[attr-defined]
     mail_connector = next(c for c in hub._connectors if c.connector_name == "mail")
     assert "gmail_school" in mail_connector._providers  # type: ignore[attr-defined]
+
+
+
+async def test_google_calendar_subcalendars_parallel_fetch_conflict_and_create_by_name(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    fetched_calendar_urls: list[str] = []
+    posted_calendar_urls: list[tuple[str, str]] = []
+
+    private_calendars = [
+        {
+            "id": "primary",
+            "summary": "メイン予定",
+            "primary": True,
+            "accessRole": "owner",
+            "selected": True,
+        },
+        {
+            "id": "jobhunt@group.calendar.google.com",
+            "summary": "就職活動",
+            "primary": False,
+            "accessRole": "owner",
+            "selected": True,
+        },
+        {
+            "id": "shift@group.calendar.google.com",
+            "summary": "シフト",
+            "primary": False,
+            "accessRole": "writer",
+            "selected": True,
+        },
+        {
+            "id": "hidden@group.calendar.google.com",
+            "summary": "非表示メモ",
+            "primary": False,
+            "accessRole": "reader",
+            "selected": False,
+        },
+    ]
+    school_calendars = [
+        {
+            "id": "school-main@edu.example.jp",
+            "summary": "授業",
+            "primary": True,
+            "accessRole": "owner",
+            "selected": True,
+        },
+        {
+            "id": "lab-shared@group.calendar.google.com",
+            "summary": "研究室ゼミ",
+            "primary": False,
+            "accessRole": "reader",
+            "selected": True,
+        },
+    ]
+
+    events_by_cal: dict[str, list[dict]] = {
+        "primary": [
+            {
+                "id": "ev-p1",
+                "summary": "歯科検診",
+                "start": {"dateTime": "2026-11-20T09:00:00+09:00"},
+                "end": {"dateTime": "2026-11-20T10:00:00+09:00"},
+            }
+        ],
+        "jobhunt@group.calendar.google.com": [
+            {
+                "id": "ev-j1",
+                "summary": "A社 二次面接",
+                "start": {"dateTime": "2026-11-20T13:00:00+09:00"},
+                "end": {"dateTime": "2026-11-20T14:00:00+09:00"},
+            }
+        ],
+        "shift@group.calendar.google.com": [
+            {
+                "id": "ev-s1",
+                "summary": "カフェバイト",
+                "start": {"dateTime": "2026-11-20T17:00:00+09:00"},
+                "end": {"dateTime": "2026-11-20T21:00:00+09:00"},
+            }
+        ],
+        "school-main@edu.example.jp": [],
+        "lab-shared@group.calendar.google.com": [
+            {
+                "id": "ev-lab1",
+                "summary": "輪講発表",
+                "start": {"dateTime": "2026-11-20T15:00:00+09:00"},
+                "end": {"dateTime": "2026-11-20T16:30:00+09:00"},
+            }
+        ],
+    }
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        path = request.url.path
+        if "oauth2.googleapis.com/token" in url:
+            tok = "school-access" if "refresh-school" in request.content.decode("utf-8") else "private-access"
+            return httpx.Response(200, json={"access_token": tok})
+
+        acct = "school" if "school-access" in request.headers.get("Authorization", "") else "private"
+        if path.endswith("/calendar/v3/users/me/calendarList"):
+            return httpx.Response(
+                200,
+                json={"items": school_calendars if acct == "school" else private_calendars},
+            )
+
+        if "/calendar/v3/calendars/" in path and path.endswith("/events") and request.method == "GET":
+            cal_key = path.split("/calendar/v3/calendars/", 1)[1].rsplit("/events", 1)[0]
+            fetched_calendar_urls.append(f"{acct}:{cal_key}")
+            if cal_key == "hidden@group.calendar.google.com":
+                raise AssertionError("selected=False calendar must not be queried when calendar_id='all'")
+            return httpx.Response(200, json={"items": events_by_cal.get(cal_key, [])})
+
+        if "/calendar/v3/calendars/" in path and path.endswith("/events") and request.method == "POST":
+            body = json.loads(request.content.decode("utf-8"))
+            posted_calendar_urls.append((acct, str(request.url.raw_path, "ascii")))
+            return httpx.Response(200, json={"id": "ev-created-sub", "summary": body["summary"]})
+
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    connector = GoogleWorkspaceMCPConnector(
+        client_id="gid",
+        client_secret="gsecret",
+        refresh_token="refresh-private",
+        refresh_token_school="refresh-school",
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(transport=transport),
+    )
+
+    # 1. calendar_list_calendars returns full metadata for both accounts (including selected=False)
+    cal_list_out = await connector.calendar_list_calendars()
+    assert "[private] [MCP: calendar] メイン予定 (id=primary, primary=True, accessRole=owner, selected=True)" in cal_list_out
+    assert "[private] [MCP: calendar] 就職活動 (id=jobhunt@group.calendar.google.com" in cal_list_out
+    assert "[private] [MCP: calendar] シフト (id=shift@group.calendar.google.com" in cal_list_out
+    assert "非表示メモ" in cal_list_out
+    assert "[school] [MCP: calendar] 研究室ゼミ (id=lab-shared@group.calendar.google.com" in cal_list_out
+
+    # 2. calendar_list_events gathers all selected=True sub-calendars and formats [account / calendar_name]
+    events_out = await connector.calendar_list_events(
+        "2026-11-20T00:00:00+09:00",
+        "2026-11-20T23:59:59+09:00",
+    )
+    assert "[private / メイン予定] [MCP: calendar]" in events_out
+    assert "[private / 就職活動] [MCP: calendar]" in events_out
+    assert "[private / シフト] [MCP: calendar]" in events_out
+    assert "[school / 研究室ゼミ] [MCP: calendar]" in events_out
+    assert "A社 二次面接" in events_out
+    assert "カフェバイト" in events_out
+    assert "輪講発表" in events_out
+
+    # 3. calendar_check_conflicts detects sub-calendar events too (not just primary)
+    conflict_out = await connector.calendar_check_conflicts(
+        "2026-11-20T18:00:00+09:00",
+        "2026-11-20T19:00:00+09:00",
+    )
+    assert '"has_conflict": true' in conflict_out
+    assert "カフェバイト" in conflict_out
+    assert '"calendar_name": "シフト"' in conflict_out
+
+    # 4. calendar_create_event resolves calendar_name="就職活動" to sub-calendar ID & defaults to primary
+    async with db_session_factory() as db:
+        req1, tok1 = await approval.create_request(
+            db, action_type="calendar_create_event", payload={"summary": "B社 説明会"}
+        )
+        await approval.resolve_request(db, approval_id=req1.id, decision="approved", raw_token=tok1)
+        req2, tok2 = await approval.create_request(
+            db, action_type="calendar_create_event", payload={"summary": "買い物"}
+        )
+        await approval.resolve_request(db, approval_id=req2.id, decision="approved", raw_token=tok2)
+        req3, tok3 = await approval.create_request(
+            db, action_type="calendar_create_event", payload={"summary": "存在しない"}
+        )
+        await approval.resolve_request(db, approval_id=req3.id, decision="approved", raw_token=tok3)
+
+    created_sub = await connector.calendar_create_event(
+        summary="B社 説明会",
+        start_time="2026-11-21T10:00:00+09:00",
+        end_time="2026-11-21T11:00:00+09:00",
+        calendar_name="就職活動",
+        approval_token=tok1,
+    )
+    assert '"calendar_id": "jobhunt@group.calendar.google.com"' in created_sub
+    assert '"calendar_name": "就職活動"' in created_sub
+    assert posted_calendar_urls[0] == (
+        "private",
+        "/calendar/v3/calendars/jobhunt%40group.calendar.google.com/events",
+    )
+
+    created_default = await connector.calendar_create_event(
+        summary="買い物",
+        start_time="2026-11-21T18:00:00+09:00",
+        end_time="2026-11-21T19:00:00+09:00",
+        approval_token=tok2,
+    )
+    assert '"calendar_id": "primary"' in created_default
+    assert posted_calendar_urls[1] == ("private", "/calendar/v3/calendars/primary/events")
+
+    with pytest.raises(ValueError, match="NonExistentCalendar"):
+        await connector.calendar_create_event(
+            summary="失敗テスト",
+            start_time="2026-11-21T20:00:00+09:00",
+            end_time="2026-11-21T21:00:00+09:00",
+            calendar_name="NonExistentCalendar",
+            approval_token=tok3,
+        )

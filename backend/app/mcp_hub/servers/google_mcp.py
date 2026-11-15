@@ -1,8 +1,8 @@
 """Google Workspace & Maps MCP connector supporting private & school dual accounts.
 
 Services:
-- Calendar v3 (`calendar_list_events`, `calendar_check_conflicts`, `calendar_create_event`,
-  `calendar_update_event`, `calendar_delete_event`)
+- Calendar v3 (`calendar_list_calendars`, `calendar_list_events`, `calendar_check_conflicts`,
+  `calendar_create_event`, `calendar_update_event`, `calendar_delete_event`)
 - Drive v3 (`drive_search_files`, `drive_read_text_file`, `drive_create_folder`, `drive_move_or_rename`)
 - Docs v1 (`docs_create_document`, `docs_get_document`, `docs_append_text`, `docs_replace_text`)
 - Sheets v4 (`sheets_create_spreadsheet`, `sheets_read_range`, `sheets_append_rows`, `sheets_update_values`)
@@ -255,6 +255,73 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
     # Google Calendar v3
     # ------------------------------------------------------------------
 
+    async def _fetch_calendar_list(
+        self,
+        client: httpx.AsyncClient,
+        token: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch all registered calendars (My Calendars & Other Calendars) via calendarList."""
+        items: list[dict[str, Any]] = []
+        page_token: str | None = None
+        while True:
+            params = {"pageToken": page_token} if page_token else None
+            resp = await client.get(
+                "https://www.googleapis.com/calendar/v3/users/me/calendarList",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            items.extend(payload.get("items") or [])
+            page_token = payload.get("nextPageToken")
+            if not page_token:
+                break
+        return items
+
+    async def _fetch_account_calendars(
+        self,
+        account: GoogleAccountName,
+    ) -> list[dict[str, Any]]:
+        async with self._create_client() as client:
+            token = await self._get_access_token(client, account)
+            raw_items = await self._fetch_calendar_list(client, token)
+        return [
+            {
+                "account": account,
+                "id": cal.get("id", ""),
+                "summary": cal.get("summary") or cal.get("summaryOverride") or cal.get("id", ""),
+                "primary": bool(cal.get("primary", False)),
+                "accessRole": cal.get("accessRole", ""),
+                "selected": bool(cal.get("selected", False)),
+            }
+            for cal in raw_items
+            if cal.get("id")
+        ]
+
+    async def calendar_list_calendars(
+        self,
+        account: GoogleAccountScope = "all",
+    ) -> str:
+        """List all registered calendars (My Calendars & Other Calendars) across accounts."""
+        per_account = await self._run_across_accounts(
+            account,
+            self._fetch_account_calendars,
+        )
+        lines: list[str] = []
+        for _acct, calendars in per_account:
+            for cal in calendars:
+                lines.append(
+                    f"- [{cal['account']}] [MCP: calendar] {cal['summary']} "
+                    f"(id={cal['id']}, primary={cal['primary']}, "
+                    f"accessRole={cal['accessRole']}, selected={cal['selected']})"
+                )
+        if not lines:
+            return wrap_untrusted_data(
+                "google_calendar:calendars",
+                "[MCP: calendar] 登録されたカレンダーはありません。",
+            )
+        return wrap_untrusted_data("google_calendar:calendars", "\n".join(lines))
+
     async def _fetch_events(
         self,
         client: httpx.AsyncClient,
@@ -277,25 +344,90 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         resp.raise_for_status()
         return resp.json().get("items") or []
 
+    async def _resolve_target_calendars_for_events(
+        self,
+        client: httpx.AsyncClient,
+        token: str,
+        account: GoogleAccountName,
+        calendar_id: str,
+    ) -> list[tuple[str, str]]:
+        """Resolve (calendar_id, calendar_name) pairs to query for events."""
+        normalized_cal = calendar_id.strip() or "all"
+        if normalized_cal != "all":
+            return [(normalized_cal, normalized_cal)]
+
+        try:
+            cal_items = await self._fetch_calendar_list(client, token)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                fallback_id = self._calendar_ids[account]
+                fallback_name = "primary" if fallback_id == "primary" else fallback_id
+                return [(fallback_id, fallback_name)]
+            raise
+
+        targets: list[tuple[str, str]] = []
+        for cal in cal_items:
+            cid = cal.get("id", "")
+            if not cid or cal.get("selected") is not True:
+                continue
+            cname = cal.get("summary") or cal.get("summaryOverride") or cid
+            targets.append((cid, cname))
+        return targets
+
     async def _fetch_account_events(
         self,
         account: GoogleAccountName,
         time_min: str,
         time_max: str,
-    ) -> list[dict[str, Any]]:
+        calendar_id: str = "all",
+    ) -> list[tuple[str, str, dict[str, Any]]]:
         async with self._create_client() as client:
             token = await self._get_access_token(client, account)
-            return await self._fetch_events(
-                client, token, self._calendar_ids[account], time_min, time_max
+            targets = await self._resolve_target_calendars_for_events(
+                client, token, account, calendar_id
+            )
+            if not targets:
+                return []
+
+            outcomes = await asyncio.gather(
+                *(
+                    self._fetch_events(client, token, cid, time_min, time_max)
+                    for cid, _ in targets
+                ),
+                return_exceptions=True,
             )
 
+        tagged_events: list[tuple[str, str, dict[str, Any]]] = []
+        errors: list[Exception] = []
+        for (cid, cname), outcome in zip(targets, outcomes):
+            if isinstance(outcome, Exception):
+                logger.warning(
+                    "Google sub-calendar fetch failed",
+                    extra={"account": account, "calendar_id": cid, "error": mask_secrets(str(outcome))},
+                )
+                errors.append(outcome)
+            else:
+                for ev in outcome:
+                    tagged_events.append((cid, cname, ev))
+
+        if not tagged_events and errors and len(errors) == len(targets):
+            raise errors[0]
+        return tagged_events
+
     @staticmethod
-    def _normalize_event(ev: dict[str, Any], account: GoogleAccountName) -> dict[str, Any]:
+    def _normalize_event(
+        ev: dict[str, Any],
+        account: GoogleAccountName,
+        calendar_id: str = "primary",
+        calendar_name: str = "primary",
+    ) -> dict[str, Any]:
         start = (ev.get("start") or {}).get("dateTime") or (ev.get("start") or {}).get("date", "")
         end = (ev.get("end") or {}).get("dateTime") or (ev.get("end") or {}).get("date", "")
         return {
             "id": ev.get("id", ""),
             "account": account,
+            "calendar_id": calendar_id,
+            "calendar_name": calendar_name,
             "summary": ev.get("summary") or "(No Title)",
             "start": start,
             "end": end,
@@ -306,15 +438,19 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         time_min: str,
         time_max: str,
         account: GoogleAccountScope = "all",
+        calendar_id: str = "all",
     ) -> list[dict[str, Any]]:
-        """Return normalized structured calendar events across requested accounts without wrapping."""
+        """Return normalized structured calendar events across requested accounts and calendars."""
         per_account = await self._run_across_accounts(
             account,
-            lambda acct: self._fetch_account_events(acct, time_min, time_max),
+            lambda acct: self._fetch_account_events(acct, time_min, time_max, calendar_id=calendar_id),
         )
         merged: list[dict[str, Any]] = []
-        for acct, events in per_account:
-            merged.extend(self._normalize_event(ev, acct) for ev in events)
+        for acct, tagged_events in per_account:
+            merged.extend(
+                self._normalize_event(ev, acct, calendar_id=cid, calendar_name=cname)
+                for cid, cname, ev in tagged_events
+            )
         merged.sort(key=lambda item: item["start"])
         return merged
 
@@ -323,16 +459,22 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         time_min: str,
         time_max: str,
         account: GoogleAccountScope = "all",
+        calendar_id: str = "all",
     ) -> str:
-        """List Google Calendar events across private/school accounts in [time_min, time_max]."""
-        events = await self.list_events_structured(time_min, time_max, account=account)
+        """List Google Calendar events across accounts and selected sub-calendars in [time_min, time_max]."""
+        events = await self.list_events_structured(
+            time_min, time_max, account=account, calendar_id=calendar_id
+        )
         if not events:
             return wrap_untrusted_data(
                 "google_calendar:events", "[MCP: calendar] 該当期間の予定はありません。"
             )
 
         lines = [
-            f"- [{ev['account']}] [MCP: calendar] {ev['start']} ~ {ev['end']}: {ev['summary']} (id={ev['id']})"
+            (
+                f"- [{ev['account']} / {ev['calendar_name']}] [MCP: calendar] "
+                f"{ev['start']} ~ {ev['end']}: {ev['summary']} (id={ev['id']})"
+            )
             for ev in events
         ]
         return wrap_untrusted_data("google_calendar:events", "\n".join(lines))
@@ -342,12 +484,16 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         start_time: str,
         end_time: str,
         account: GoogleAccountScope = "all",
+        calendar_id: str = "all",
     ) -> str:
-        """Check for overlapping calendar events across requested accounts."""
-        conflicts = await self.list_events_structured(start_time, end_time, account=account)
+        """Check for overlapping calendar events across requested accounts and calendars."""
+        conflicts = await self.list_events_structured(
+            start_time, end_time, account=account, calendar_id=calendar_id
+        )
         payload = {
             "citation": "[MCP: calendar]",
             "account_scope": account,
+            "calendar_id": calendar_id,
             "has_conflict": len(conflicts) > 0,
             "conflict_count": len(conflicts),
             "conflicts": conflicts,
@@ -357,6 +503,37 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             json.dumps(payload, ensure_ascii=False),
         )
 
+    @staticmethod
+    def _match_calendar_by_name(
+        cal_items: list[dict[str, Any]],
+        calendar_name: str,
+    ) -> tuple[str, str] | None:
+        wanted = calendar_name.strip()
+        if not wanted:
+            return None
+        for cal in cal_items:
+            cid = cal.get("id", "")
+            if not cid:
+                continue
+            candidates = [
+                str(cal.get("summary") or "").strip(),
+                str(cal.get("summaryOverride") or "").strip(),
+            ]
+            if wanted in candidates:
+                return cid, candidates[0] or candidates[1] or cid
+        wanted_lower = wanted.lower()
+        for cal in cal_items:
+            cid = cal.get("id", "")
+            if not cid:
+                continue
+            candidates = [
+                str(cal.get("summary") or "").strip(),
+                str(cal.get("summaryOverride") or "").strip(),
+            ]
+            if any(c.lower() == wanted_lower for c in candidates if c):
+                return cid, candidates[0] or candidates[1] or cid
+        return None
+
     async def calendar_create_event(
         self,
         summary: str,
@@ -365,19 +542,32 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         description: str = "",
         approval_token: str = "",
         account: GoogleAccountName = "private",
+        calendar_id: str = "primary",
+        calendar_name: str = "",
     ) -> str:
-        """Create a Google Calendar event after verifying one-time approval_token (defaults to private)."""
+        """Create a Google Calendar event after verifying one-time approval_token (defaults to private/primary)."""
         await self._verify_and_consume_approval("calendar_create_event", approval_token)
         acct = self._resolve_single_account(account)
-        cal_id = quote(self._calendar_ids[acct], safe="")
 
         async with self._create_client() as client:
             token = await self._get_access_token(client, acct)
+            target_cal_id = calendar_id.strip() or "primary"
+            target_cal_name = target_cal_id
+            if calendar_name.strip():
+                cal_items = await self._fetch_calendar_list(client, token)
+                matched = self._match_calendar_by_name(cal_items, calendar_name)
+                if matched is None:
+                    raise ValueError(
+                        f"Google Calendar '{calendar_name}' was not found for account '{acct}'."
+                    )
+                target_cal_id, target_cal_name = matched
+
+            cal_id_encoded = quote(target_cal_id, safe="")
             existing = await self._fetch_events(
-                client, token, self._calendar_ids[acct], start_time, end_time
+                client, token, target_cal_id, start_time, end_time
             )
             resp = await client.post(
-                f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events",
+                f"https://www.googleapis.com/calendar/v3/calendars/{cal_id_encoded}/events",
                 headers={"Authorization": f"Bearer {token}"},
                 json={
                     "summary": summary,
@@ -393,6 +583,8 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             "citation": "[MCP: calendar]",
             "status": "created",
             "account": acct,
+            "calendar_id": target_cal_id,
+            "calendar_name": target_cal_name,
             "event_id": created.get("id", ""),
             "summary": created.get("summary", summary),
             "overlap_warning": len(existing) > 0,
@@ -412,11 +604,12 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         description: str | None = None,
         approval_token: str = "",
         account: GoogleAccountName = "private",
+        calendar_id: str = "primary",
     ) -> str:
         """Update an existing Google Calendar event after verifying one-time approval_token."""
         await self._verify_and_consume_approval("calendar_update_event", approval_token)
         acct = self._resolve_single_account(account)
-        cal_id = quote(self._calendar_ids[acct], safe="")
+        cal_id = quote(calendar_id.strip() or self._calendar_ids[acct], safe="")
 
         patch_body: dict[str, Any] = {}
         if summary is not None:
@@ -455,11 +648,12 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         event_id: str,
         approval_token: str = "",
         account: GoogleAccountName = "private",
+        calendar_id: str = "primary",
     ) -> str:
         """Delete a Google Calendar event after verifying one-time approval_token."""
         await self._verify_and_consume_approval("calendar_delete_event", approval_token)
         acct = self._resolve_single_account(account)
-        cal_id = quote(self._calendar_ids[acct], safe="")
+        cal_id = quote(calendar_id.strip() or self._calendar_ids[acct], safe="")
 
         async with self._create_client() as client:
             token = await self._get_access_token(client, acct)
@@ -1276,8 +1470,16 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             tools.extend(
                 [
                     MCPTool(
+                        name="calendar_list_calendars",
+                        description="List all registered Google Calendars (My Calendars & Other Calendars) across private/school/all accounts.",
+                        handler=self.calendar_list_calendars,
+                        requires_approval=False,
+                        source_type="google_calendar",
+                        already_wrapped=True,
+                    ),
+                    MCPTool(
                         name="calendar_list_events",
-                        description="List Google Calendar events across private/school/all accounts.",
+                        description="List Google Calendar events across private/school/all accounts and selected sub-calendars (calendar_id='all').",
                         handler=self.calendar_list_events,
                         requires_approval=False,
                         source_type="google_calendar",
@@ -1285,7 +1487,7 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
                     ),
                     MCPTool(
                         name="calendar_check_conflicts",
-                        description="Check overlapping calendar events across private/school/all accounts.",
+                        description="Check overlapping calendar events across private/school/all accounts and selected sub-calendars (calendar_id='all').",
                         handler=self.calendar_check_conflicts,
                         requires_approval=False,
                         source_type="google_calendar",
@@ -1293,7 +1495,7 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
                     ),
                     MCPTool(
                         name="calendar_create_event",
-                        description="Create a Google Calendar event (requires approval_token; defaults to private).",
+                        description="Create a Google Calendar event on primary or named sub-calendar (requires approval_token; defaults to private/primary).",
                         handler=self.calendar_create_event,
                         requires_approval=True,
                         source_type="google_calendar",
