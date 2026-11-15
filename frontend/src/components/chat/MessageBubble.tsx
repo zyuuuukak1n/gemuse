@@ -1,5 +1,6 @@
 "use client";
 
+import type { ReactNode } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { BookOpen, ExternalLink, Paperclip, Sparkles, User } from "lucide-react";
@@ -11,6 +12,20 @@ import { ThinkingAccordion } from "./ThinkingAccordion";
 interface MessageBubbleProps {
   message: ChatMessage;
   onApprovalUpdate?: (messageId: string, updated: ApprovalCardData) => void;
+}
+
+function extractNodeText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map(extractNodeText).join("");
+  }
+  if (node && typeof node === "object" && "props" in node) {
+    const props = (node as { props?: { children?: ReactNode } }).props;
+    return props?.children ? extractNodeText(props.children) : "";
+  }
+  return "";
 }
 
 const markdownComponents: Components = {
@@ -28,6 +43,42 @@ const markdownComponents: Components = {
         <span>{children}</span>
         {isExternal ? <ExternalLink className="inline h-3 w-3 shrink-0" strokeWidth={1.75} /> : null}
       </a>
+    );
+  },
+  table: ({ children, ...props }) => (
+    <div
+      data-testid="markdown-table-scroll"
+      className="my-3 w-full overflow-x-auto rounded-xl border border-slate-200 dark:border-slate-800"
+    >
+      <table
+        className="w-max min-w-full border-collapse text-left text-xs sm:text-sm"
+        {...props}
+      >
+        {children}
+      </table>
+    </div>
+  ),
+  th: ({ children, ...props }) => (
+    <th
+      className="whitespace-nowrap border-b border-slate-200 bg-slate-100/80 px-3 py-2 font-semibold text-slate-800 dark:border-slate-800 dark:bg-slate-900/80 dark:text-slate-200"
+      {...props}
+    >
+      {children}
+    </th>
+  ),
+  td: ({ children, ...props }) => {
+    const textLength = extractNodeText(children).trim().length;
+    return (
+      <td
+        className={`border-b border-slate-100 px-3 py-2 align-top text-slate-700 dark:border-slate-800/70 dark:text-slate-300 ${
+          textLength > 24
+            ? "min-w-[160px] whitespace-normal"
+            : "whitespace-nowrap"
+        }`}
+        {...props}
+      >
+        {children}
+      </td>
     );
   },
 };

@@ -1,183 +1,408 @@
 "use client";
 
+import React, { useEffect, useRef, useState, type TouchEvent } from "react";
 import {
-  BrainCircuit,
-  Globe,
-  LayoutDashboard,
-  LogOut,
-  MessageSquare,
-  Settings,
-  ShieldAlert,
+  Check,
+  ChevronDown,
+  Menu,
+  PanelRightClose,
+  PanelRightOpen,
   Sparkles,
+  SquarePen,
 } from "lucide-react";
-import type { WorkspaceTab } from "@/types/gemuse";
+import type { ConversationSummary, ThinkingLevel, WorkspaceTab } from "@/types/gemuse";
+import { ConversationSidebar } from "@/components/chat/ConversationSidebar";
 import { ThemeToggle } from "./ThemeToggle";
+
+const THINKING_OPTIONS: Array<{
+  id: ThinkingLevel;
+  label: string;
+  hint: string;
+}> = [
+  { id: "auto", label: "Auto", hint: "質問の複雑度に応じて自動切替" },
+  { id: "low", label: "Low", hint: "軽量・高速レスポンス" },
+  { id: "medium", label: "Medium", hint: "日常タスク向けバランス" },
+  { id: "high", label: "High", hint: "深い推論・ツール連携" },
+  { id: "xhigh", label: "X-High", hint: "徹底熟考・複雑調査向け" },
+];
+
+const TAB_TITLE_MAP: Record<WorkspaceTab, string> = {
+  chat: "チャット",
+  dashboard: "統合ダッシュボード",
+  memory: "記憶・Gemini連携",
+  browser: "ブラウザ監視",
+  settings: "設定",
+};
 
 interface NavigationShellProps {
   activeTab: WorkspaceTab;
   onSelectTab: (tab: WorkspaceTab) => void;
+  conversations: ConversationSummary[];
+  activeConversationId: string | null;
+  pinnedConversationIds: string[];
+  loadingConversations: boolean;
+  onSelectConversation: (id: string) => void;
+  onNewConversation: () => void;
+  onTogglePinConversation: (id: string) => void;
+  onDeleteConversation: (id: string) => void;
+  onRefreshConversations: () => void;
+  thinkingLevel: ThinkingLevel;
+  onChangeThinkingLevel: (level: ThinkingLevel) => void;
+  backgroundMode: boolean;
+  onToggleBackgroundMode: (value: boolean) => void;
+  activeBackgroundJobStatus?: string | null;
+  showBrowserPane: boolean;
+  onToggleBrowserPane: () => void;
   pendingApprovalCount: number;
   browserPaused: boolean;
   onLogout: () => void;
   children: React.ReactNode;
 }
 
-const NAV_ITEMS: Array<{
-  id: WorkspaceTab;
-  label: string;
-  mobileLabel: string;
-  icon: typeof MessageSquare;
-}> = [
-  { id: "chat", label: "チャット", mobileLabel: "チャット", icon: MessageSquare },
-  { id: "browser", label: "ブラウザ監視", mobileLabel: "ブラウザ", icon: Globe },
-  { id: "dashboard", label: "ダッシュボード", mobileLabel: "統合", icon: LayoutDashboard },
-  { id: "memory", label: "記憶・Gemini連携", mobileLabel: "記憶・連携", icon: BrainCircuit },
-  { id: "settings", label: "連携設定", mobileLabel: "設定", icon: Settings },
-];
-
 export function NavigationShell({
   activeTab,
   onSelectTab,
+  conversations,
+  activeConversationId,
+  pinnedConversationIds,
+  loadingConversations,
+  onSelectConversation,
+  onNewConversation,
+  onTogglePinConversation,
+  onDeleteConversation,
+  onRefreshConversations,
+  thinkingLevel,
+  onChangeThinkingLevel,
+  backgroundMode,
+  onToggleBackgroundMode,
+  activeBackgroundJobStatus = null,
+  showBrowserPane,
+  onToggleBrowserPane,
   pendingApprovalCount,
   browserPaused,
   onLogout,
   children,
 }: NavigationShellProps) {
+  const [mobileDrawerOpen, setMobileDrawerOpen] = useState(false);
+  const [desktopDrawerOpen, setDesktopDrawerOpen] = useState(true);
+  const [modelPopoverOpen, setModelPopoverOpen] = useState(false);
+
+  const popoverContainerRef = useRef<HTMLDivElement>(null);
+  const touchStartRef = useRef<{
+    x: number;
+    y: number;
+    startedFromEdge: boolean;
+    wasOpen: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    if (!modelPopoverOpen) return;
+
+    function handleOutside(e: MouseEvent | TouchEvent) {
+      const target = e.target as Node | null;
+      if (
+        popoverContainerRef.current &&
+        target &&
+        !popoverContainerRef.current.contains(target)
+      ) {
+        setModelPopoverOpen(false);
+      }
+    }
+
+    function handleKey(e: KeyboardEvent) {
+      if (e.key === "Escape") {
+        setModelPopoverOpen(false);
+      }
+    }
+
+    document.addEventListener("mousedown", handleOutside);
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.removeEventListener("mousedown", handleOutside);
+      document.removeEventListener("keydown", handleKey);
+    };
+  }, [modelPopoverOpen]);
+
+  const currentThinkingLabel =
+    THINKING_OPTIONS.find((opt) => opt.id === thinkingLevel)?.label || "Auto";
+
+  function handleHamburgerClick() {
+    if (typeof window !== "undefined" && window.innerWidth >= 1024) {
+      setDesktopDrawerOpen((prev) => !prev);
+    } else {
+      setMobileDrawerOpen((prev) => !prev);
+    }
+  }
+
+  function handleCloseDrawer() {
+    if (typeof window !== "undefined" && window.innerWidth >= 1024) {
+      setDesktopDrawerOpen(false);
+    } else {
+      setMobileDrawerOpen(false);
+    }
+  }
+
+  function handleTouchStart(e: TouchEvent<HTMLDivElement>) {
+    const touch = e.touches[0];
+    if (!touch) return;
+    touchStartRef.current = {
+      x: touch.clientX,
+      y: touch.clientY,
+      startedFromEdge: touch.clientX <= 40,
+      wasOpen: mobileDrawerOpen,
+    };
+  }
+
+  function handleTouchEnd(e: TouchEvent<HTMLDivElement>) {
+    const start = touchStartRef.current;
+    touchStartRef.current = null;
+    const touch = e.changedTouches[0];
+    if (!start || !touch) return;
+
+    const dx = touch.clientX - start.x;
+    const dy = touch.clientY - start.y;
+    if (Math.abs(dx) <= Math.abs(dy) * 1.2) {
+      return;
+    }
+
+    if (!start.wasOpen && start.startedFromEdge && dx > 50) {
+      setMobileDrawerOpen(true);
+    } else if (start.wasOpen && dx < -50) {
+      setMobileDrawerOpen(false);
+    }
+  }
+
   return (
-    <div className="flex h-screen w-full flex-col overflow-hidden bg-slate-50 dark:bg-[#090d0b] md:flex-row">
-      {/* Desktop Rail */}
-      <aside className="hidden w-56 shrink-0 flex-col justify-between border-r border-slate-200 bg-white/90 px-3 py-4 dark:border-emerald-950/60 dark:bg-[#0d1310] md:flex">
-        <div>
-          <div className="mb-6 flex items-center gap-2.5 px-2">
-            <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-emerald-500/15 text-emerald-500 ring-1 ring-emerald-500/30">
-              <Sparkles className="h-4 w-4" strokeWidth={1.75} />
-            </div>
-            <div>
-              <div className="text-base font-semibold tracking-tight text-slate-900 dark:text-white">
-                gemuse
-              </div>
-              <div className="text-[11px] text-emerald-600 dark:text-emerald-400">
-                Gemini × Muse
-              </div>
-            </div>
-          </div>
+    <div
+      data-testid="app-shell"
+      onTouchStart={handleTouchStart}
+      onTouchEnd={handleTouchEnd}
+      className="flex h-[100dvh] w-full overflow-hidden bg-slate-50 dark:bg-[#090d0b]"
+    >
+      {/* Mobile Backdrop */}
+      {mobileDrawerOpen ? (
+        <div
+          data-testid="drawer-backdrop"
+          onClick={() => setMobileDrawerOpen(false)}
+          className="fixed inset-0 z-40 bg-black/50 backdrop-blur-xs transition-opacity lg:hidden"
+        />
+      ) : null}
 
-          <nav className="space-y-1" aria-label="メインナビゲーション">
-            {NAV_ITEMS.map((item) => {
-              const Icon = item.icon;
-              const active = activeTab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => onSelectTab(item.id)}
-                  className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-sm font-medium transition ${
-                    active
-                      ? "bg-emerald-500/15 text-emerald-700 ring-1 ring-emerald-500/30 dark:text-emerald-300"
-                      : "text-slate-600 hover:bg-slate-100 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-slate-800/60 dark:hover:text-slate-100"
-                  }`}
-                >
-                  <span className="flex items-center gap-2.5">
-                    <Icon className="h-4 w-4" strokeWidth={1.75} />
-                    <span>{item.label}</span>
-                  </span>
-                  {item.id === "chat" && pendingApprovalCount > 0 ? (
-                    <span className="inline-flex min-w-5 items-center justify-center rounded-full bg-amber-500 px-1.5 py-0.5 text-[11px] font-semibold text-slate-950">
-                      {pendingApprovalCount}
-                    </span>
-                  ) : null}
-                  {item.id === "browser" && browserPaused ? (
-                    <span
-                      title="Take Control 一時停止中"
-                      className="h-2.5 w-2.5 rounded-full bg-amber-500 ring-2 ring-amber-500/30"
-                    />
-                  ) : null}
-                </button>
-              );
-            })}
-          </nav>
-        </div>
-
-        <div className="space-y-2 border-t border-slate-200 pt-3 dark:border-slate-800">
-          {pendingApprovalCount > 0 ? (
-            <div className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-              <ShieldAlert className="h-4 w-4 shrink-0" strokeWidth={1.75} />
-              <span>承認待ち {pendingApprovalCount} 件</span>
-            </div>
-          ) : null}
-          <div className="flex items-center justify-between gap-2 px-1">
-            <ThemeToggle />
-            <button
-              type="button"
-              onClick={onLogout}
-              title="ログアウト"
-              className="inline-flex items-center gap-1 rounded-xl border border-slate-200 px-2.5 py-1.5 text-xs text-slate-600 transition hover:border-rose-500/40 hover:text-rose-600 dark:border-slate-800 dark:text-slate-400 dark:hover:text-rose-400"
-            >
-              <LogOut className="h-3.5 w-3.5" strokeWidth={1.75} />
-              <span>終了</span>
-            </button>
-          </div>
-        </div>
+      {/* Unified Left Drawer (Mobile Overlay + Collapsible Desktop Sidebar) */}
+      <aside
+        data-testid="unified-drawer"
+        aria-label="サイドナビゲーション"
+        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col border-r border-slate-200 bg-white transition-all duration-200 ease-out dark:border-emerald-950/60 dark:bg-[#0d1310] lg:static lg:z-auto lg:max-w-none lg:shrink-0 ${
+          mobileDrawerOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full"
+        } ${
+          desktopDrawerOpen
+            ? "lg:w-72 lg:translate-x-0"
+            : "lg:w-0 lg:-translate-x-full lg:overflow-hidden lg:border-r-0"
+        }`}
+      >
+        <ConversationSidebar
+          activeTab={activeTab}
+          onSelectTab={(tab) => {
+            onSelectTab(tab);
+            setMobileDrawerOpen(false);
+          }}
+          conversations={conversations}
+          activeConversationId={activeConversationId}
+          pinnedConversationIds={pinnedConversationIds}
+          loading={loadingConversations}
+          pendingApprovalCount={pendingApprovalCount}
+          browserPaused={browserPaused}
+          onSelectConversation={(id) => {
+            onSelectConversation(id);
+            setMobileDrawerOpen(false);
+          }}
+          onNewConversation={() => {
+            onNewConversation();
+            setMobileDrawerOpen(false);
+          }}
+          onTogglePin={onTogglePinConversation}
+          onDeleteConversation={onDeleteConversation}
+          onRefresh={onRefreshConversations}
+          onCloseDrawer={handleCloseDrawer}
+          onLogout={onLogout}
+        />
       </aside>
 
-      {/* Mobile Top Bar */}
-      <header className="flex items-center justify-between border-b border-slate-200 bg-white/90 px-4 py-2.5 dark:border-emerald-950/60 dark:bg-[#0d1310] md:hidden">
-        <div className="flex items-center gap-2">
-          <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-emerald-500/15 text-emerald-500">
-            <Sparkles className="h-4 w-4" strokeWidth={1.75} />
-          </div>
-          <span className="text-sm font-semibold text-slate-900 dark:text-white">gemuse</span>
-          {pendingApprovalCount > 0 ? (
-            <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-semibold text-slate-950">
-              承認 {pendingApprovalCount}
-            </span>
-          ) : null}
-        </div>
-        <div className="flex items-center gap-2">
-          <ThemeToggle />
-          <button
-            type="button"
-            onClick={onLogout}
-            aria-label="ログアウト"
-            className="rounded-xl border border-slate-200 p-1.5 text-slate-600 dark:border-slate-800 dark:text-slate-300"
-          >
-            <LogOut className="h-3.5 w-3.5" strokeWidth={1.75} />
-          </button>
-        </div>
-      </header>
+      {/* Main Content Column */}
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
+        {/* Fixed Safe-Area Top Header */}
+        <header
+          data-testid="top-header"
+          className="z-30 shrink-0 border-b border-slate-200/80 bg-white/90 px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 backdrop-blur-md dark:border-emerald-950/60 dark:bg-[#0d1310]/90 sm:px-4"
+        >
+          <div className="flex items-center justify-between gap-2">
+            {/* Left + Model/Thinking Dropdown */}
+            <div className="flex min-w-0 items-center gap-2">
+              <button
+                type="button"
+                onClick={handleHamburgerClick}
+                aria-label="メニューを開く"
+                aria-expanded={mobileDrawerOpen}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-slate-700 transition hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+              >
+                <Menu className="h-4 w-4" strokeWidth={1.75} />
+              </button>
 
-      {/* Main Content */}
-      <main className="min-h-0 flex-1 overflow-hidden">{children}</main>
+              <div ref={popoverContainerRef} className="relative min-w-0">
+                <button
+                  type="button"
+                  onClick={() => setModelPopoverOpen((v) => !v)}
+                  aria-expanded={modelPopoverOpen}
+                  aria-haspopup="dialog"
+                  className="inline-flex max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left transition hover:bg-slate-100 dark:hover:bg-slate-800/80"
+                >
+                  <Sparkles
+                    className="h-3.5 w-3.5 shrink-0 text-emerald-500"
+                    strokeWidth={1.75}
+                  />
+                  <span className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100 sm:text-sm">
+                    Gemini 4 Hydrogen · {currentThinkingLabel}
+                  </span>
+                  {backgroundMode ? (
+                    <span className="hidden rounded-md bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 sm:inline">
+                      BG
+                    </span>
+                  ) : null}
+                  {activeTab !== "chat" ? (
+                    <span className="hidden rounded-md bg-slate-200/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300 md:inline">
+                      {TAB_TITLE_MAP[activeTab]}
+                    </span>
+                  ) : null}
+                  <ChevronDown
+                    className={`h-3.5 w-3.5 shrink-0 text-slate-400 transition-transform ${
+                      modelPopoverOpen ? "rotate-180" : ""
+                    }`}
+                    strokeWidth={1.75}
+                  />
+                </button>
 
-      {/* Mobile Bottom Navigation */}
-      <nav
-        aria-label="モバイルナビゲーション"
-        className="grid grid-cols-5 border-t border-slate-200 bg-white/95 pb-safe dark:border-emerald-950/60 dark:bg-[#0d1310] md:hidden"
-      >
-        {NAV_ITEMS.map((item) => {
-          const Icon = item.icon;
-          const active = activeTab === item.id;
-          return (
-            <button
-              key={item.id}
-              type="button"
-              onClick={() => onSelectTab(item.id)}
-              className={`relative flex flex-col items-center justify-center gap-0.5 py-2 text-[10px] font-medium ${
-                active
-                  ? "text-emerald-600 dark:text-emerald-400"
-                  : "text-slate-500 dark:text-slate-400"
-              }`}
-            >
-              <Icon className="h-4 w-4" strokeWidth={1.75} />
-              <span>{item.mobileLabel}</span>
-              {item.id === "chat" && pendingApprovalCount > 0 ? (
-                <span className="absolute right-3 top-1 h-2 w-2 rounded-full bg-amber-500" />
+                {modelPopoverOpen ? (
+                  <div
+                    role="dialog"
+                    aria-label="モデルとThinking設定"
+                    data-testid="thinking-popover"
+                    className="absolute left-0 top-full z-50 mt-2 w-72 rounded-2xl border border-slate-200 bg-white p-3 shadow-xl dark:border-slate-800 dark:bg-[#111916]"
+                  >
+                    <div className="mb-2 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
+                      Thinking レベル
+                    </div>
+                    <div className="space-y-1">
+                      {THINKING_OPTIONS.map((opt) => {
+                        const selected = thinkingLevel === opt.id;
+                        return (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            onClick={() => {
+                              onChangeThinkingLevel(opt.id);
+                              setModelPopoverOpen(false);
+                            }}
+                            className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left transition ${
+                              selected
+                                ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                                : "text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800/70"
+                            }`}
+                          >
+                            <div>
+                              <div className="text-xs font-semibold">{opt.label}</div>
+                              <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                                {opt.hint}
+                              </div>
+                            </div>
+                            {selected ? (
+                              <Check className="h-4 w-4 shrink-0 text-emerald-500" strokeWidth={2} />
+                            ) : null}
+                          </button>
+                        );
+                      })}
+                    </div>
+
+                    <div className="mt-2.5 border-t border-slate-200/80 pt-2.5 dark:border-slate-800">
+                      <div className="flex items-center justify-between gap-3 px-1">
+                        <div>
+                          <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
+                            バックグラウンド実行
+                          </div>
+                          <div className="text-[11px] text-slate-500 dark:text-slate-400">
+                            ARQ非同期キューで長時間処理
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={backgroundMode}
+                          aria-label="バックグラウンド実行"
+                          onClick={() => onToggleBackgroundMode(!backgroundMode)}
+                          className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full transition-colors ${
+                            backgroundMode
+                              ? "bg-emerald-600"
+                              : "bg-slate-300 dark:bg-slate-700"
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                              backgroundMode ? "translate-x-6" : "translate-x-1"
+                            }`}
+                          />
+                        </button>
+                      </div>
+                      {activeBackgroundJobStatus ? (
+                        <p className="mt-1.5 px-1 text-[11px] text-emerald-600 dark:text-emerald-400">
+                          現在のBGジョブ: {activeBackgroundJobStatus}
+                        </p>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
+            {/* Right Fixed Action Buttons */}
+            <div className="flex shrink-0 items-center gap-1.5">
+              {activeTab === "chat" ? (
+                <button
+                  type="button"
+                  onClick={onToggleBrowserPane}
+                  aria-label={showBrowserPane ? "Live Browserを隠す" : "Live Browserを表示"}
+                  title="Live Browser スプリット切替"
+                  className={`inline-flex h-9 items-center gap-1.5 rounded-xl border px-2.5 text-xs font-medium transition ${
+                    showBrowserPane
+                      ? "border-emerald-500 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                      : "border-slate-200/80 bg-white text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+                  }`}
+                >
+                  {showBrowserPane ? (
+                    <PanelRightClose className="h-4 w-4" strokeWidth={1.75} />
+                  ) : (
+                    <PanelRightOpen className="h-4 w-4" strokeWidth={1.75} />
+                  )}
+                  <span className="hidden md:inline">Browser</span>
+                </button>
               ) : null}
-            </button>
-          );
-        })}
-      </nav>
+
+              <button
+                type="button"
+                onClick={onNewConversation}
+                aria-label="新しいチャット"
+                title="新しいチャットを開始"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-slate-700 transition hover:border-emerald-500/50 hover:text-emerald-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:text-emerald-400"
+              >
+                <SquarePen className="h-4 w-4" strokeWidth={1.75} />
+              </button>
+
+              <ThemeToggle />
+            </div>
+          </div>
+        </header>
+
+        {/* Scrollable Workspace Content */}
+        <main className="min-h-0 flex-1 overflow-hidden">{children}</main>
+      </div>
     </div>
   );
 }
-

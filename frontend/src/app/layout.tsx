@@ -43,6 +43,7 @@ export const viewport: Viewport = {
   initialScale: 1,
   maximumScale: 1,
   viewportFit: "cover",
+  interactiveWidget: "resizes-content",
 };
 
 export default function RootLayout({
@@ -52,7 +53,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="ja" className="dark" suppressHydrationWarning>
-      <body className="min-h-screen bg-slate-50 text-slate-900 antialiased dark:bg-[#090d0b] dark:text-slate-100">
+      <body className="flex h-[100dvh] flex-col overflow-hidden bg-slate-50 text-slate-900 antialiased dark:bg-[#090d0b] dark:text-slate-100">
         {children}
       </body>
     </html>

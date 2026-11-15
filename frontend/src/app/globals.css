@@ -10,6 +10,13 @@ html.dark {
   color-scheme: dark;
 }
 
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior-y: none;
+}
+
 body {
   font-family: "Inter", "Noto Sans JP", "Hiragino Kaku Gothic ProN", "Yu Gothic UI", system-ui, sans-serif;
 }
