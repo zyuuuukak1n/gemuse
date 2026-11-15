@@ -3,15 +3,15 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDown,
-  Bot,
-  Brain,
-  Compass,
+  Briefcase,
+  CalendarClock,
+  FileText,
   Loader2,
-  Mail,
-  Sparkles,
   X,
+  Youtube,
 } from "lucide-react";
 import { consumeSSEStream } from "@/lib/sse-client";
+import { triggerHaptic } from "@/lib/haptics";
 import type {
   ApprovalCardData,
   ChatMessage,
@@ -40,26 +40,26 @@ interface ChatWorkspaceProps {
   onBrowserPauseStateChange?: (paused: boolean) => void;
 }
 
-const SUGGESTION_CARDS = [
+const WELCOME_CHIPS = [
   {
-    icon: Mail,
-    title: "連絡・予定の整理",
-    prompt: "未読メールと参加Discordの直近メッセージ、今日の予定を要約してください。",
+    icon: CalendarClock,
+    label: "今日の予定と未読メールを確認",
+    prompt: "今日の予定と未読メールを確認",
   },
   {
-    icon: Compass,
-    title: "自律ブラウザ調査",
-    prompt: "ブラウザで最新のWeb開発ドキュメントを開き、要点を整理してください。",
+    icon: Briefcase,
+    label: "就活の連絡・締切をまとめて",
+    prompt: "就活の連絡・締切をまとめて",
   },
   {
-    icon: Brain,
-    title: "記憶との統合",
-    prompt: "コアメモリと直近のエピソード記憶を踏まえて、今週の優先タスクを提案して。",
+    icon: FileText,
+    label: "新しいGoogleドキュメントを作成",
+    prompt: "新しいGoogleドキュメントを作成",
   },
   {
-    icon: Bot,
-    title: "スキル手順の確認",
-    prompt: "登録済みの自動化スキル一覧と活用可能なツールを教えてください。",
+    icon: Youtube,
+    label: "YouTubeの最新登録チャンネルを確認",
+    prompt: "YouTubeの最新登録チャンネルを確認",
   },
 ];
 
@@ -68,6 +68,28 @@ function createTempId(prefix: string): string {
     return `${prefix}-${crypto.randomUUID()}`;
   }
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function FourPointSparkleIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden="true"
+      className={className}
+    >
+      <defs>
+        <linearGradient id="gemuse-star-grad" x1="0" y1="0" x2="24" y2="24" gradientUnits="userSpaceOnUse">
+          <stop offset="0%" stopColor="#6EE7B7" />
+          <stop offset="100%" stopColor="#10B981" />
+        </linearGradient>
+      </defs>
+      <path
+        d="M12 1.5C12.8 7.5 16.5 11.2 22.5 12C16.5 12.8 12.8 16.5 12 22.5C11.2 16.5 7.5 12.8 1.5 12C7.5 11.2 11.2 7.5 12 1.5Z"
+        fill="url(#gemuse-star-grad)"
+      />
+    </svg>
+  );
 }
 
 export function ChatWorkspace({
@@ -97,6 +119,9 @@ export function ChatWorkspace({
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const consumedPromptRef = useRef<string | null>(null);
   const skipNextDetailLoadForIdRef = useRef<string | null>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const messagesRef = useRef<ChatMessage[]>(messages);
+  messagesRef.current = messages;
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "smooth") => {
     messagesEndRef.current?.scrollIntoView({ behavior });
@@ -112,6 +137,9 @@ export function ChatWorkspace({
   // Reset when user explicitly triggers a new chat
   useEffect(() => {
     if (newChatTrigger === 0) return;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    setSending(false);
     setMessages([]);
     setActiveBackgroundJob(null);
     setErrorBanner(null);
@@ -180,6 +208,15 @@ export function ChatWorkspace({
       ).length,
     [messages]
   );
+
+  const lastUserMessageId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === "user") {
+        return messages[i].id;
+      }
+    }
+    return null;
+  }, [messages]);
 
   useEffect(() => {
     onPendingApprovalCountChange?.(pendingApprovals);
@@ -250,8 +287,31 @@ export function ChatWorkspace({
     []
   );
 
+  const handleStopGeneration = useCallback(() => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setSending(false);
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.is_streaming
+          ? {
+              ...m,
+              is_streaming: false,
+              content: m.content.trim() ? m.content : "（応答の生成を停止しました）",
+            }
+          : m
+      )
+    );
+  }, []);
+
   const handleSend = useCallback(
     async (text: string, attachments: string[]) => {
+      abortControllerRef.current?.abort();
+      const controller = new AbortController();
+      abortControllerRef.current = controller;
+
       setErrorBanner(null);
       setSending(true);
       setShowScrollToBottom(false);
@@ -282,6 +342,7 @@ export function ChatWorkspace({
         const res = await fetch("/api/proxy/chat", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
           body: JSON.stringify({
             message: text,
             conversation_id: activeConversationId,
@@ -448,6 +509,25 @@ export function ChatWorkspace({
           }
         });
       } catch (err) {
+        const isAbort =
+          (err instanceof DOMException && err.name === "AbortError") ||
+          (err instanceof Error && err.name === "AbortError");
+        if (isAbort) {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantMsgId
+                ? {
+                    ...m,
+                    content: m.content.trim()
+                      ? m.content
+                      : "（応答の生成を停止しました）",
+                    is_streaming: false,
+                  }
+                : m
+            )
+          );
+          return;
+        }
         const message =
           err instanceof Error ? err.message : "メッセージ送信に失敗しました。";
         setErrorBanner(message);
@@ -463,6 +543,9 @@ export function ChatWorkspace({
           )
         );
       } finally {
+        if (abortControllerRef.current === controller) {
+          abortControllerRef.current = null;
+        }
         setSending(false);
         setMessages((prev) =>
           prev.map((m) =>
@@ -483,6 +566,43 @@ export function ChatWorkspace({
     ]
   );
 
+  const handleRegenerateMessage = useCallback(
+    (assistantMessageId: string) => {
+      if (sending) return;
+      const current = messagesRef.current;
+      const targetIdx = current.findIndex((m) => m.id === assistantMessageId);
+      if (targetIdx < 0) return;
+
+      let prevUserIdx = -1;
+      for (let i = targetIdx - 1; i >= 0; i -= 1) {
+        if (current[i]?.role === "user") {
+          prevUserIdx = i;
+          break;
+        }
+      }
+      if (prevUserIdx < 0) return;
+      const userMsg = current[prevUserIdx];
+      setMessages(current.slice(0, prevUserIdx));
+      void handleSend(userMsg.content, userMsg.attachments || []);
+    },
+    [handleSend, sending]
+  );
+
+  const handleEditResendMessage = useCallback(
+    (userMessageId: string, newContent: string) => {
+      if (sending) return;
+      const trimmed = newContent.trim();
+      if (!trimmed) return;
+      const current = messagesRef.current;
+      const targetIdx = current.findIndex((m) => m.id === userMessageId);
+      if (targetIdx < 0) return;
+      const targetMsg = current[targetIdx];
+      setMessages(current.slice(0, targetIdx));
+      void handleSend(trimmed, targetMsg.attachments || []);
+    },
+    [handleSend, sending]
+  );
+
   // Trigger handoff prompt passed from CommandDashboard
   useEffect(() => {
     if (
@@ -500,7 +620,7 @@ export function ChatWorkspace({
   return (
     <div className="relative flex h-full w-full overflow-hidden">
       {/* Center Chat Area */}
-      <div className="relative flex min-w-0 flex-1 flex-col bg-slate-50/40 dark:bg-slate-950">
+      <div className="relative flex min-w-0 flex-1 flex-col bg-slate-50 dark:bg-slate-950">
         {errorBanner ? (
           <div className="mx-3 mt-2.5 flex shrink-0 items-center justify-between rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2 text-xs text-rose-700 dark:border-rose-500/40 dark:bg-rose-950/40 dark:text-rose-200 sm:mx-4">
             <span>{errorBanner}</span>
@@ -529,39 +649,35 @@ export function ChatWorkspace({
                 会話を読み込み中...
               </div>
             ) : messages.length === 0 ? (
-              <div className="mx-auto flex max-w-2xl flex-col items-center justify-center py-8 text-center sm:py-12">
-                <div className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl bg-emerald-500/15 text-emerald-600 ring-1 ring-emerald-500/30 dark:text-emerald-400">
-                  <Sparkles className="h-6 w-6" />
+              <div
+                data-testid="welcome-screen"
+                className="mx-auto flex min-h-full max-w-2xl flex-col items-center justify-center py-6 text-center"
+              >
+                <div className="mb-5 flex h-16 w-16 items-center justify-center rounded-3xl bg-emerald-500/15 ring-1 ring-emerald-500/30 shadow-lg shadow-emerald-500/10">
+                  <FourPointSparkleIcon className="h-9 w-9" />
                 </div>
-                <h3 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
-                  Gemuse Personal Orchestrator
-                </h3>
-                <p className="mt-1.5 max-w-md text-xs leading-relaxed text-slate-500 dark:text-slate-400">
-                  3層メモリ・MCPツール・隔離ブラウザを統合したパーソナルAIエージェント。
-                  外部送信や決裁にはワンタイム承認カードが作動します。
+                <h2 className="text-2xl font-semibold tracking-tight text-slate-900 dark:text-white sm:text-3xl">
+                  何かお手伝いできますか？
+                </h2>
+                <p className="mt-2 max-w-md text-xs leading-relaxed text-slate-500 dark:text-slate-400">
+                  3層メモリ・Google Workspace・Discord/メール・自律ブラウザを連携して実行します。
                 </p>
 
-                <div className="mt-6 grid w-full grid-cols-1 gap-2.5 sm:grid-cols-2">
-                  {SUGGESTION_CARDS.map((card) => {
-                    const Icon = card.icon;
+                <div className="mt-7 flex w-full flex-wrap items-center justify-center gap-2.5">
+                  {WELCOME_CHIPS.map((chip) => {
+                    const Icon = chip.icon;
                     return (
                       <button
-                        key={card.title}
+                        key={chip.label}
                         type="button"
-                        onClick={() => void handleSend(card.prompt, [])}
-                        className="group flex items-start gap-3 rounded-xl border border-slate-200 bg-white p-3.5 text-left transition-all hover:border-emerald-400 hover:shadow-sm dark:border-slate-800 dark:bg-slate-900/70 dark:hover:border-emerald-500/60"
+                        onClick={() => {
+                          triggerHaptic();
+                          void handleSend(chip.prompt, []);
+                        }}
+                        className="inline-flex min-h-[44px] items-center gap-2 rounded-2xl border border-slate-200 bg-white px-3.5 py-2 text-left text-xs font-medium text-slate-700 shadow-xs transition-transform duration-100 hover:border-emerald-500/60 hover:text-emerald-700 active:scale-95 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-emerald-500/50 dark:hover:text-emerald-300"
                       >
-                        <div className="mt-0.5 rounded-lg bg-emerald-50 p-2 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400">
-                          <Icon className="h-4 w-4" />
-                        </div>
-                        <div className="min-w-0">
-                          <div className="text-xs font-semibold text-slate-800 group-hover:text-emerald-600 dark:text-slate-100 dark:group-hover:text-emerald-400">
-                            {card.title}
-                          </div>
-                          <div className="mt-0.5 line-clamp-2 text-[11px] text-slate-500 dark:text-slate-400">
-                            {card.prompt}
-                          </div>
-                        </div>
+                        <Icon className="h-4 w-4 shrink-0 text-emerald-500" strokeWidth={1.75} />
+                        <span>{chip.label}</span>
                       </button>
                     );
                   })}
@@ -573,7 +689,10 @@ export function ChatWorkspace({
                   <MessageBubble
                     key={msg.id}
                     message={msg}
+                    isLastUserMessage={!sending && msg.id === lastUserMessageId}
                     onApprovalUpdate={handleApprovalUpdate}
+                    onRegenerate={handleRegenerateMessage}
+                    onEditResend={handleEditResendMessage}
                   />
                 ))}
                 <div ref={messagesEndRef} />
@@ -585,12 +704,13 @@ export function ChatWorkspace({
             <button
               type="button"
               onClick={() => {
+                triggerHaptic();
                 setShowScrollToBottom(false);
                 scrollToBottom("smooth");
               }}
               aria-label="最新へスクロール"
               title="最新メッセージへ移動"
-              className="absolute bottom-3 right-4 z-20 flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white/95 text-slate-700 shadow-lg backdrop-blur-sm transition hover:border-emerald-500 hover:text-emerald-600 dark:border-slate-700 dark:bg-slate-900/95 dark:text-slate-200 dark:hover:border-emerald-500 dark:hover:text-emerald-400"
+              className="absolute bottom-3 right-4 z-20 flex h-11 w-11 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-700 shadow-lg transition-transform duration-100 hover:border-emerald-500 hover:text-emerald-600 active:scale-95 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-200 dark:hover:border-emerald-500 dark:hover:text-emerald-400"
             >
               <ArrowDown className="h-4 w-4" strokeWidth={2} />
             </button>
@@ -598,20 +718,27 @@ export function ChatWorkspace({
         </div>
 
         {/* Slim Composer */}
-        <ChatComposer sending={sending} onSend={handleSend} />
+        <ChatComposer
+          sending={sending}
+          onSend={handleSend}
+          onStop={handleStopGeneration}
+        />
       </div>
 
       {/* Split Live Browser Panel */}
       {showBrowserPane ? (
-        <aside className="fixed inset-0 z-40 flex flex-col bg-white dark:bg-slate-950 xl:static xl:z-auto xl:w-[460px] xl:flex-shrink-0 xl:border-l xl:border-slate-200 xl:dark:border-slate-800">
-          <div className="flex items-center justify-between border-b border-slate-200 px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 dark:border-slate-800 xl:hidden">
+        <aside className="fixed inset-0 z-40 flex flex-col bg-white dark:bg-[#0f172a] xl:static xl:z-auto xl:w-[460px] xl:flex-shrink-0 xl:border-l xl:border-slate-200 xl:dark:border-slate-800">
+          <div className="flex items-center justify-between border-b border-slate-200 bg-white px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 dark:border-slate-800 dark:bg-[#0f172a] xl:hidden">
             <span className="text-xs font-semibold text-slate-800 dark:text-slate-200">
               Live Browser Split View
             </span>
             <button
               type="button"
-              onClick={() => onChangeShowBrowserPane(false)}
-              className="rounded-lg p-1.5 text-slate-500 hover:bg-slate-100 dark:text-slate-400 dark:hover:bg-slate-800"
+              onClick={() => {
+                triggerHaptic();
+                onChangeShowBrowserPane(false);
+              }}
+              className="flex h-11 w-11 items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 active:scale-95 dark:text-slate-400 dark:hover:bg-slate-800"
               aria-label="ブラウザパネルを閉じる"
             >
               <X className="h-4 w-4" />

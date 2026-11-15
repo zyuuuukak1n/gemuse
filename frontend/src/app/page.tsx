@@ -4,7 +4,12 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { registerGemuseServiceWorker } from "@/lib/push";
-import type { ConversationSummary, ThinkingLevel, WorkspaceTab } from "@/types/gemuse";
+import type {
+  ChatFolder,
+  ConversationSummary,
+  ThinkingLevel,
+  WorkspaceTab,
+} from "@/types/gemuse";
 import { NavigationShell } from "@/components/layout/NavigationShell";
 import { ChatWorkspace } from "@/components/chat/ChatWorkspace";
 import { LiveBrowserPanel } from "@/components/browser/LiveBrowserPanel";
@@ -22,6 +27,9 @@ const VALID_TABS: WorkspaceTab[] = [
 
 const PINNED_STORAGE_KEY = "gemuse_pinned_conversations";
 const DELETED_STORAGE_KEY = "gemuse_deleted_conversations";
+const CUSTOM_TITLES_STORAGE_KEY = "gemuse_custom_conversation_titles";
+const FOLDERS_STORAGE_KEY = "gemuse_chat_folders";
+const CONVERSATION_FOLDERS_STORAGE_KEY = "gemuse_conversation_folders";
 
 function parseTabParam(raw: string | null): WorkspaceTab {
   if (raw && (VALID_TABS as string[]).includes(raw)) {
@@ -30,15 +38,29 @@ function parseTabParam(raw: string | null): WorkspaceTab {
   return "chat";
 }
 
-function readStoredIds(key: string): string[] {
+function readStoredJson<T>(key: string, fallback: T): T {
   try {
     const raw = window.localStorage.getItem(key);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw) as unknown;
-    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+    if (!raw) return fallback;
+    return JSON.parse(raw) as T;
   } catch {
-    return [];
+    return fallback;
   }
+}
+
+function writeStoredJson(key: string, value: unknown): void {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Ignore storage quota/access errors
+  }
+}
+
+function createFolderId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `folder-${crypto.randomUUID()}`;
+  }
+  return `folder-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
 export default function HomePage() {
@@ -52,7 +74,7 @@ export default function HomePage() {
   const [showBrowserPane, setShowBrowserPane] = useState(false);
   const [handoffPromptToChat, setHandoffPromptToChat] = useState<string | null>(null);
 
-  // Unified Chat & Model State
+  // Unified Chat, Model & Organization State
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>("auto");
   const [backgroundMode, setBackgroundMode] = useState(false);
   const [activeBackgroundJobStatus, setActiveBackgroundJobStatus] = useState<string | null>(null);
@@ -62,12 +84,42 @@ export default function HomePage() {
   const [newChatTrigger, setNewChatTrigger] = useState(0);
   const [pinnedConversationIds, setPinnedConversationIds] = useState<string[]>([]);
   const [deletedConversationIds, setDeletedConversationIds] = useState<string[]>([]);
+  const [customTitles, setCustomTitles] = useState<Record<string, string>>({});
+  const [folders, setFolders] = useState<ChatFolder[]>([]);
+  const [conversationFolders, setConversationFolders] = useState<Record<string, string>>({});
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     setActiveTab(parseTabParam(params.get("tab")));
-    setPinnedConversationIds(readStoredIds(PINNED_STORAGE_KEY));
-    setDeletedConversationIds(readStoredIds(DELETED_STORAGE_KEY));
+    const storedPinned = readStoredJson<unknown>(PINNED_STORAGE_KEY, []);
+    setPinnedConversationIds(
+      Array.isArray(storedPinned)
+        ? storedPinned.filter((v): v is string => typeof v === "string")
+        : []
+    );
+    const storedDeleted = readStoredJson<unknown>(DELETED_STORAGE_KEY, []);
+    setDeletedConversationIds(
+      Array.isArray(storedDeleted)
+        ? storedDeleted.filter((v): v is string => typeof v === "string")
+        : []
+    );
+    const storedTitles = readStoredJson<unknown>(CUSTOM_TITLES_STORAGE_KEY, {});
+    if (storedTitles && typeof storedTitles === "object" && !Array.isArray(storedTitles)) {
+      setCustomTitles(storedTitles as Record<string, string>);
+    }
+    const storedFolders = readStoredJson<unknown>(FOLDERS_STORAGE_KEY, []);
+    if (Array.isArray(storedFolders)) {
+      setFolders(
+        storedFolders.filter(
+          (f): f is ChatFolder =>
+            Boolean(f && typeof f === "object" && typeof f.id === "string" && typeof f.name === "string")
+        )
+      );
+    }
+    const storedConvFolders = readStoredJson<unknown>(CONVERSATION_FOLDERS_STORAGE_KEY, {});
+    if (storedConvFolders && typeof storedConvFolders === "object" && !Array.isArray(storedConvFolders)) {
+      setConversationFolders(storedConvFolders as Record<string, string>);
+    }
   }, []);
 
   const fetchConversations = useCallback(async () => {
@@ -150,50 +202,134 @@ export default function HomePage() {
       const next = prev.includes(conversationId)
         ? prev.filter((id) => id !== conversationId)
         : [...prev, conversationId];
-      try {
-        window.localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(next));
-      } catch {
-        // Ignore storage errors
-      }
+      writeStoredJson(PINNED_STORAGE_KEY, next);
       return next;
     });
   }, []);
+
+  const handleRenameConversation = useCallback(
+    async (conversationId: string, rawTitle: string) => {
+      const trimmed = rawTitle.trim();
+      if (!trimmed) return;
+
+      setConversations((prev) =>
+        prev.map((conv) => (conv.id === conversationId ? { ...conv, title: trimmed } : conv))
+      );
+      setCustomTitles((prev) => {
+        const next = { ...prev, [conversationId]: trimmed };
+        writeStoredJson(CUSTOM_TITLES_STORAGE_KEY, next);
+        return next;
+      });
+
+      try {
+        await fetch(`/api/proxy/chat/conversations/${encodeURIComponent(conversationId)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: trimmed }),
+        });
+      } catch {
+        // Keep local custom title persistence even if network update fails
+      }
+    },
+    []
+  );
 
   const handleDeleteConversation = useCallback(
     (conversationId: string) => {
       setDeletedConversationIds((prev) => {
         if (prev.includes(conversationId)) return prev;
         const next = [...prev, conversationId];
-        try {
-          window.localStorage.setItem(DELETED_STORAGE_KEY, JSON.stringify(next));
-        } catch {
-          // Ignore storage errors
-        }
+        writeStoredJson(DELETED_STORAGE_KEY, next);
         return next;
       });
       setPinnedConversationIds((prev) => {
         if (!prev.includes(conversationId)) return prev;
         const next = prev.filter((id) => id !== conversationId);
-        try {
-          window.localStorage.setItem(PINNED_STORAGE_KEY, JSON.stringify(next));
-        } catch {
-          // Ignore storage errors
-        }
+        writeStoredJson(PINNED_STORAGE_KEY, next);
+        return next;
+      });
+      setConversationFolders((prev) => {
+        if (!(conversationId in prev)) return prev;
+        const next = { ...prev };
+        delete next[conversationId];
+        writeStoredJson(CONVERSATION_FOLDERS_STORAGE_KEY, next);
         return next;
       });
       if (activeConversationId === conversationId) {
         setActiveConversationId(null);
         setNewChatTrigger((c) => c + 1);
       }
+      void fetch(`/api/proxy/chat/conversations/${encodeURIComponent(conversationId)}`, {
+        method: "DELETE",
+      }).catch(() => undefined);
     },
     [activeConversationId]
   );
 
+  const handleCreateFolder = useCallback((rawName: string) => {
+    const trimmed = rawName.trim();
+    if (!trimmed) return;
+    setFolders((prev) => {
+      const next: ChatFolder[] = [
+        ...prev,
+        { id: createFolderId(), name: trimmed, created_at: new Date().toISOString() },
+      ];
+      writeStoredJson(FOLDERS_STORAGE_KEY, next);
+      return next;
+    });
+  }, []);
+
+  const handleRenameFolder = useCallback((folderId: string, rawName: string) => {
+    const trimmed = rawName.trim();
+    if (!trimmed) return;
+    setFolders((prev) => {
+      const next = prev.map((f) => (f.id === folderId ? { ...f, name: trimmed } : f));
+      writeStoredJson(FOLDERS_STORAGE_KEY, next);
+      return next;
+    });
+  }, []);
+
+  const handleDeleteFolder = useCallback((folderId: string) => {
+    setFolders((prev) => {
+      const next = prev.filter((f) => f.id !== folderId);
+      writeStoredJson(FOLDERS_STORAGE_KEY, next);
+      return next;
+    });
+    // Safely return any conversations inside the deleted folder to uncategorized
+    setConversationFolders((prev) => {
+      const next: Record<string, string> = {};
+      for (const [convId, fId] of Object.entries(prev)) {
+        if (fId !== folderId) {
+          next[convId] = fId;
+        }
+      }
+      writeStoredJson(CONVERSATION_FOLDERS_STORAGE_KEY, next);
+      return next;
+    });
+  }, []);
+
+  const handleMoveConversationToFolder = useCallback(
+    (conversationId: string, folderId: string | null) => {
+      setConversationFolders((prev) => {
+        const next = { ...prev };
+        if (!folderId) {
+          delete next[conversationId];
+        } else {
+          next[conversationId] = folderId;
+        }
+        writeStoredJson(CONVERSATION_FOLDERS_STORAGE_KEY, next);
+        return next;
+      });
+    },
+    []
+  );
+
   const visibleConversations = useMemo(() => {
-    if (deletedConversationIds.length === 0) return conversations;
     const deletedSet = new Set(deletedConversationIds);
-    return conversations.filter((c) => !deletedSet.has(c.id));
-  }, [conversations, deletedConversationIds]);
+    return conversations
+      .filter((c) => !deletedSet.has(c.id))
+      .map((c) => (customTitles[c.id] ? { ...c, title: customTitles[c.id] } : c));
+  }, [conversations, customTitles, deletedConversationIds]);
 
   const handleLogout = useCallback(async () => {
     try {
@@ -213,7 +349,7 @@ export default function HomePage() {
 
   if (!authChecked || !authenticated) {
     return (
-      <div className="flex h-[100dvh] items-center justify-center bg-slate-950 text-slate-200">
+      <div className="flex h-[100dvh] items-center justify-center bg-[#0f172a] text-slate-200">
         <div className="flex items-center gap-2.5 text-sm">
           <Loader2 className="h-5 w-5 animate-spin text-emerald-500" />
           <span>Gemuse セッションを確認中...</span>
@@ -229,11 +365,18 @@ export default function HomePage() {
       conversations={visibleConversations}
       activeConversationId={activeConversationId}
       pinnedConversationIds={pinnedConversationIds}
+      folders={folders}
+      conversationFolders={conversationFolders}
       loadingConversations={loadingConversations}
       onSelectConversation={handleSelectConversation}
       onNewConversation={handleNewConversation}
       onTogglePinConversation={handleTogglePinConversation}
+      onRenameConversation={handleRenameConversation}
       onDeleteConversation={handleDeleteConversation}
+      onCreateFolder={handleCreateFolder}
+      onRenameFolder={handleRenameFolder}
+      onDeleteFolder={handleDeleteFolder}
+      onMoveConversationToFolder={handleMoveConversationToFolder}
       onRefreshConversations={() => void fetchConversations()}
       thinkingLevel={thinkingLevel}
       onChangeThinkingLevel={setThinkingLevel}
@@ -265,8 +408,8 @@ export default function HomePage() {
       )}
 
       {activeTab === "browser" && (
-        <div className="h-full overflow-y-auto px-4 py-5 md:px-6">
-          <div className="mx-auto max-w-5xl">
+        <div className="h-full overflow-y-auto bg-slate-50 p-3 sm:p-4 dark:bg-slate-950">
+          <div className="mx-auto h-full max-w-6xl">
             <LiveBrowserPanel
               sessionId={browserSessionId}
               onSessionIdChange={setBrowserSessionId}
@@ -279,7 +422,7 @@ export default function HomePage() {
       {activeTab === "dashboard" && (
         <CommandDashboard
           onStartChatWithPrompt={handleStartChatWithPrompt}
-          onNavigateTab={handleSelectTab}
+          onNavigateTab={(t) => handleSelectTab(t)}
         />
       )}
 

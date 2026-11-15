@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -39,6 +39,20 @@ class BackgroundChatResponse(BaseModel):
     conversation_id: uuid.UUID
     status: str
     thinking_level: str
+
+
+class ConversationRenameRequest(BaseModel):
+    """Validated payload for PATCH /api/chat/conversations/{conversation_id}."""
+
+    title: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("title")
+    @classmethod
+    def _validate_non_blank_title(cls, value: str) -> str:
+        trimmed = value.strip()
+        if not trimmed:
+            raise ValueError("Conversation title must not be blank")
+        return trimmed
 
 
 @router.post("")
@@ -234,4 +248,49 @@ async def get_conversation_detail(
             for j in jobs[:10]
         ],
     }
+
+
+@router.patch("/conversations/{conversation_id}")
+async def rename_conversation(
+    conversation_id: uuid.UUID,
+    payload: ConversationRenameRequest,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Update a conversation's title after validating non-blank input."""
+    conv = (
+        await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    ).scalar_one_or_none()
+    if conv is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+    conv.title = payload.title
+    await db.commit()
+    await db.refresh(conv)
+    return {
+        "id": str(conv.id),
+        "title": conv.title,
+        "created_at": conv.created_at.isoformat(),
+        "updated_at": conv.updated_at.isoformat(),
+    }
+
+
+@router.delete("/conversations/{conversation_id}")
+async def delete_conversation(
+    conversation_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db_session),
+) -> dict[str, Any]:
+    """Delete a conversation and cascade its messages/jobs."""
+    conv = (
+        await db.execute(select(Conversation).where(Conversation.id == conversation_id))
+    ).scalar_one_or_none()
+    if conv is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Conversation not found",
+        )
+    await db.delete(conv)
+    await db.commit()
+    return {"deleted": True, "id": str(conversation_id)}
 

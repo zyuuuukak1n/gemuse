@@ -10,8 +10,14 @@ import {
   Sparkles,
   SquarePen,
 } from "lucide-react";
-import type { ConversationSummary, ThinkingLevel, WorkspaceTab } from "@/types/gemuse";
+import type {
+  ChatFolder,
+  ConversationSummary,
+  ThinkingLevel,
+  WorkspaceTab,
+} from "@/types/gemuse";
 import { ConversationSidebar } from "@/components/chat/ConversationSidebar";
+import { triggerHaptic } from "@/lib/haptics";
 import { ThemeToggle } from "./ThemeToggle";
 
 const THINKING_OPTIONS: Array<{
@@ -40,11 +46,18 @@ interface NavigationShellProps {
   conversations: ConversationSummary[];
   activeConversationId: string | null;
   pinnedConversationIds: string[];
+  folders?: ChatFolder[];
+  conversationFolders?: Record<string, string>;
   loadingConversations: boolean;
   onSelectConversation: (id: string) => void;
   onNewConversation: () => void;
   onTogglePinConversation: (id: string) => void;
+  onRenameConversation?: (id: string, newTitle: string) => Promise<void> | void;
   onDeleteConversation: (id: string) => void;
+  onCreateFolder?: (name: string) => void;
+  onRenameFolder?: (folderId: string, newName: string) => void;
+  onDeleteFolder?: (folderId: string) => void;
+  onMoveConversationToFolder?: (conversationId: string, folderId: string | null) => void;
   onRefreshConversations: () => void;
   thinkingLevel: ThinkingLevel;
   onChangeThinkingLevel: (level: ThinkingLevel) => void;
@@ -59,17 +72,26 @@ interface NavigationShellProps {
   children: React.ReactNode;
 }
 
+const NOOP = () => undefined;
+
 export function NavigationShell({
   activeTab,
   onSelectTab,
   conversations,
   activeConversationId,
   pinnedConversationIds,
+  folders = [],
+  conversationFolders = {},
   loadingConversations,
   onSelectConversation,
   onNewConversation,
   onTogglePinConversation,
+  onRenameConversation = NOOP,
   onDeleteConversation,
+  onCreateFolder = NOOP,
+  onRenameFolder = NOOP,
+  onDeleteFolder = NOOP,
+  onMoveConversationToFolder = NOOP,
   onRefreshConversations,
   thinkingLevel,
   onChangeThinkingLevel,
@@ -98,7 +120,7 @@ export function NavigationShell({
   useEffect(() => {
     if (!modelPopoverOpen) return;
 
-    function handleOutside(e: MouseEvent | TouchEvent) {
+    function handleOutside(e: MouseEvent) {
       const target = e.target as Node | null;
       if (
         popoverContainerRef.current &&
@@ -127,6 +149,7 @@ export function NavigationShell({
     THINKING_OPTIONS.find((opt) => opt.id === thinkingLevel)?.label || "Auto";
 
   function handleHamburgerClick() {
+    triggerHaptic();
     if (typeof window !== "undefined" && window.innerWidth >= 1024) {
       setDesktopDrawerOpen((prev) => !prev);
     } else {
@@ -135,6 +158,7 @@ export function NavigationShell({
   }
 
   function handleCloseDrawer() {
+    triggerHaptic();
     if (typeof window !== "undefined" && window.innerWidth >= 1024) {
       setDesktopDrawerOpen(false);
     } else {
@@ -177,14 +201,14 @@ export function NavigationShell({
       data-testid="app-shell"
       onTouchStart={handleTouchStart}
       onTouchEnd={handleTouchEnd}
-      className="flex h-[100dvh] w-full overflow-hidden bg-slate-50 dark:bg-[#090d0b]"
+      className="flex h-[100dvh] w-full overflow-hidden bg-white dark:bg-[#0f172a]"
     >
-      {/* Mobile Backdrop */}
+      {/* Mobile Backdrop (solid dim without blur haze) */}
       {mobileDrawerOpen ? (
         <div
           data-testid="drawer-backdrop"
           onClick={() => setMobileDrawerOpen(false)}
-          className="fixed inset-0 z-40 bg-black/50 backdrop-blur-xs transition-opacity lg:hidden"
+          className="fixed inset-0 z-40 bg-black/50 transition-opacity lg:hidden"
         />
       ) : null}
 
@@ -192,7 +216,7 @@ export function NavigationShell({
       <aside
         data-testid="unified-drawer"
         aria-label="サイドナビゲーション"
-        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col border-r border-slate-200 bg-white transition-all duration-200 ease-out dark:border-emerald-950/60 dark:bg-[#0d1310] lg:static lg:z-auto lg:max-w-none lg:shrink-0 ${
+        className={`fixed inset-y-0 left-0 z-50 flex w-72 max-w-[85vw] flex-col border-r border-slate-200 bg-white transition-all duration-200 ease-out dark:border-slate-800 dark:bg-[#0f172a] lg:static lg:z-auto lg:max-w-none lg:shrink-0 ${
           mobileDrawerOpen ? "translate-x-0 shadow-2xl" : "-translate-x-full"
         } ${
           desktopDrawerOpen
@@ -209,6 +233,8 @@ export function NavigationShell({
           conversations={conversations}
           activeConversationId={activeConversationId}
           pinnedConversationIds={pinnedConversationIds}
+          folders={folders}
+          conversationFolders={conversationFolders}
           loading={loadingConversations}
           pendingApprovalCount={pendingApprovalCount}
           browserPaused={browserPaused}
@@ -221,7 +247,12 @@ export function NavigationShell({
             setMobileDrawerOpen(false);
           }}
           onTogglePin={onTogglePinConversation}
+          onRenameConversation={onRenameConversation}
           onDeleteConversation={onDeleteConversation}
+          onCreateFolder={onCreateFolder}
+          onRenameFolder={onRenameFolder}
+          onDeleteFolder={onDeleteFolder}
+          onMoveConversationToFolder={onMoveConversationToFolder}
           onRefresh={onRefreshConversations}
           onCloseDrawer={handleCloseDrawer}
           onLogout={onLogout}
@@ -229,35 +260,38 @@ export function NavigationShell({
       </aside>
 
       {/* Main Content Column */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        {/* Fixed Safe-Area Top Header */}
+      <div className="flex min-w-0 flex-1 flex-col overflow-hidden bg-white dark:bg-[#0f172a]">
+        {/* Fixed Solid Safe-Area Top Header (Zero transparency/blur haze) */}
         <header
           data-testid="top-header"
-          className="z-30 shrink-0 border-b border-slate-200/80 bg-white/90 px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 backdrop-blur-md dark:border-emerald-950/60 dark:bg-[#0d1310]/90 sm:px-4"
+          className="z-30 shrink-0 border-b border-slate-200 bg-white px-3 pt-[max(0.5rem,env(safe-area-inset-top))] pb-2 dark:border-slate-800 dark:bg-[#0f172a] sm:px-4"
         >
           <div className="flex items-center justify-between gap-2">
             {/* Left + Model/Thinking Dropdown */}
-            <div className="flex min-w-0 items-center gap-2">
+            <div className="flex min-w-0 items-center gap-1.5">
               <button
                 type="button"
                 onClick={handleHamburgerClick}
                 aria-label="メニューを開く"
                 aria-expanded={mobileDrawerOpen}
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-slate-700 transition hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 transition-transform duration-100 hover:bg-slate-100 active:scale-95 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:bg-slate-800"
               >
-                <Menu className="h-4 w-4" strokeWidth={1.75} />
+                <Menu className="h-5 w-5" strokeWidth={1.75} />
               </button>
 
               <div ref={popoverContainerRef} className="relative min-w-0">
                 <button
                   type="button"
-                  onClick={() => setModelPopoverOpen((v) => !v)}
+                  onClick={() => {
+                    triggerHaptic();
+                    setModelPopoverOpen((v) => !v);
+                  }}
                   aria-expanded={modelPopoverOpen}
                   aria-haspopup="dialog"
-                  className="inline-flex max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left transition hover:bg-slate-100 dark:hover:bg-slate-800/80"
+                  className="inline-flex min-h-[44px] max-w-full items-center gap-1.5 rounded-xl px-2.5 py-1.5 text-left transition-transform duration-100 hover:bg-slate-100 active:scale-95 dark:hover:bg-slate-800"
                 >
                   <Sparkles
-                    className="h-3.5 w-3.5 shrink-0 text-emerald-500"
+                    className="h-4 w-4 shrink-0 text-emerald-500"
                     strokeWidth={1.75}
                   />
                   <span className="truncate text-xs font-semibold text-slate-900 dark:text-slate-100 sm:text-sm">
@@ -269,7 +303,7 @@ export function NavigationShell({
                     </span>
                   ) : null}
                   {activeTab !== "chat" ? (
-                    <span className="hidden rounded-md bg-slate-200/80 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 dark:bg-slate-800 dark:text-slate-300 md:inline">
+                    <span className="hidden rounded-md bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-700 dark:bg-slate-800 dark:text-slate-300 md:inline">
                       {TAB_TITLE_MAP[activeTab]}
                     </span>
                   ) : null}
@@ -286,7 +320,7 @@ export function NavigationShell({
                     role="dialog"
                     aria-label="モデルとThinking設定"
                     data-testid="thinking-popover"
-                    className="absolute left-0 top-full z-50 mt-2 w-72 rounded-2xl border border-slate-200 bg-white p-3 shadow-xl dark:border-slate-800 dark:bg-[#111916]"
+                    className="absolute left-0 top-full z-50 mt-2 w-72 rounded-2xl border border-slate-200 bg-white p-3 shadow-xl dark:border-slate-800 dark:bg-slate-900"
                   >
                     <div className="mb-2 px-1 text-[11px] font-semibold tracking-wide text-slate-400">
                       Thinking レベル
@@ -299,13 +333,14 @@ export function NavigationShell({
                             key={opt.id}
                             type="button"
                             onClick={() => {
+                              triggerHaptic();
                               onChangeThinkingLevel(opt.id);
                               setModelPopoverOpen(false);
                             }}
-                            className={`flex w-full items-center justify-between rounded-xl px-2.5 py-2 text-left transition ${
+                            className={`flex min-h-[44px] w-full items-center justify-between rounded-xl px-2.5 py-2 text-left transition-transform duration-100 active:scale-95 ${
                               selected
                                 ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
-                                : "text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800/70"
+                                : "text-slate-700 hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-slate-800"
                             }`}
                           >
                             <div>
@@ -322,7 +357,7 @@ export function NavigationShell({
                       })}
                     </div>
 
-                    <div className="mt-2.5 border-t border-slate-200/80 pt-2.5 dark:border-slate-800">
+                    <div className="mt-2.5 border-t border-slate-200 pt-2.5 dark:border-slate-800">
                       <div className="flex items-center justify-between gap-3 px-1">
                         <div>
                           <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
@@ -337,15 +372,18 @@ export function NavigationShell({
                           role="switch"
                           aria-checked={backgroundMode}
                           aria-label="バックグラウンド実行"
-                          onClick={() => onToggleBackgroundMode(!backgroundMode)}
-                          className={`relative inline-flex h-6 w-11 shrink-0 cursor-pointer items-center rounded-full transition-colors ${
+                          onClick={() => {
+                            triggerHaptic();
+                            onToggleBackgroundMode(!backgroundMode);
+                          }}
+                          className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer items-center rounded-full transition-colors active:scale-95 ${
                             backgroundMode
                               ? "bg-emerald-600"
                               : "bg-slate-300 dark:bg-slate-700"
                           }`}
                         >
                           <span
-                            className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${
+                            className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
                               backgroundMode ? "translate-x-6" : "translate-x-1"
                             }`}
                           />
@@ -367,13 +405,16 @@ export function NavigationShell({
               {activeTab === "chat" ? (
                 <button
                   type="button"
-                  onClick={onToggleBrowserPane}
+                  onClick={() => {
+                    triggerHaptic();
+                    onToggleBrowserPane();
+                  }}
                   aria-label={showBrowserPane ? "Live Browserを隠す" : "Live Browserを表示"}
                   title="Live Browser スプリット切替"
-                  className={`inline-flex h-9 items-center gap-1.5 rounded-xl border px-2.5 text-xs font-medium transition ${
+                  className={`inline-flex min-h-[44px] min-w-[44px] items-center justify-center gap-1.5 rounded-xl border px-2.5 text-xs font-medium transition-transform duration-100 active:scale-95 ${
                     showBrowserPane
                       ? "border-emerald-500 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
-                      : "border-slate-200/80 bg-white text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
+                      : "border-slate-200 bg-white text-slate-600 hover:bg-slate-100 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300 dark:hover:bg-slate-800"
                   }`}
                 >
                   {showBrowserPane ? (
@@ -387,10 +428,13 @@ export function NavigationShell({
 
               <button
                 type="button"
-                onClick={onNewConversation}
+                onClick={() => {
+                  triggerHaptic();
+                  onNewConversation();
+                }}
                 aria-label="新しいチャット"
                 title="新しいチャットを開始"
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-slate-200/80 bg-white text-slate-700 transition hover:border-emerald-500/50 hover:text-emerald-600 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:text-emerald-400"
+                className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-white text-slate-700 transition-transform duration-100 hover:border-emerald-500/50 hover:text-emerald-600 active:scale-95 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-200 dark:hover:text-emerald-400"
               >
                 <SquarePen className="h-4 w-4" strokeWidth={1.75} />
               </button>

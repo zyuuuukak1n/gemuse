@@ -21,8 +21,17 @@ export function ThinkingAccordion({
     return null;
   }
 
+  const hasActiveTool = toolCalls.some(
+    (tool) => tool.status !== "completed" && tool.status !== "error"
+  );
+  const statusLabel = isStreaming
+    ? hasActiveTool
+      ? "ツールを実行中..."
+      : "思考中..."
+    : "思考プロセスと実行ツール";
+
   return (
-    <div className="mb-2.5 rounded-xl border border-slate-200 bg-slate-50/80 dark:border-slate-800 dark:bg-slate-900/50">
+    <div className="mb-2.5 rounded-xl border border-slate-200 bg-slate-50 dark:border-slate-800 dark:bg-slate-900">
       <button
         type="button"
         onClick={() => setOpen((prev) => !prev)}
@@ -33,9 +42,7 @@ export function ThinkingAccordion({
             className={`h-3.5 w-3.5 text-emerald-500 ${isStreaming ? "animate-pulse" : ""}`}
             strokeWidth={1.75}
           />
-          <span>
-            {isStreaming ? "思考・ツール連携を実行中..." : "思考プロセスと実行ツール"}
-          </span>
+          <span>{statusLabel}</span>
           {toolCalls.length > 0 ? (
             <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-semibold text-emerald-600 dark:text-emerald-400">
               ツール {toolCalls.length}件
@@ -84,4 +91,3 @@ export function ThinkingAccordion({
     </div>
   );
 }
-

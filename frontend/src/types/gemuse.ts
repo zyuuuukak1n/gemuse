@@ -2,6 +2,12 @@ export type ThinkingLevel = "auto" | "low" | "medium" | "high" | "xhigh";
 
 export type WorkspaceTab = "chat" | "browser" | "dashboard" | "memory" | "settings";
 
+export interface ChatFolder {
+  id: string;
+  name: string;
+  created_at: string;
+}
+
 export type JobStatus =
   | "queued"
   | "running"

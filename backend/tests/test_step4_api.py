@@ -67,6 +67,35 @@ async def test_chat_conversations_list_and_detail(
     assert len(detail["messages"]) == 2
     assert detail["jobs"][0]["job_id"] == str(job_id)
 
+    # Reject blank rename with 422
+    blank_rename = await api_client.patch(
+        f"/api/chat/conversations/{conv_id}",
+        headers=auth_headers,
+        json={"title": "   "},
+    )
+    assert blank_rename.status_code == 422
+
+    # Valid rename persists trimmed title
+    rename_resp = await api_client.patch(
+        f"/api/chat/conversations/{conv_id}",
+        headers=auth_headers,
+        json={"title": "  リネーム済み会話  "},
+    )
+    assert rename_resp.status_code == 200
+    assert rename_resp.json()["title"] == "リネーム済み会話"
+
+    # Delete removes conversation
+    del_resp = await api_client.delete(
+        f"/api/chat/conversations/{conv_id}", headers=auth_headers
+    )
+    assert del_resp.status_code == 200
+    assert del_resp.json()["deleted"] is True
+
+    after_del = await api_client.get(
+        f"/api/chat/conversations/{conv_id}", headers=auth_headers
+    )
+    assert after_del.status_code == 404
+
 
 async def test_jobs_list_and_dashboard_summary(
     api_client: AsyncClient,
