@@ -555,8 +555,9 @@ class MailMCPConnector(BaseMCPConnector):
         limit_per_provider: int = 10,
     ) -> str:
         """Search emails in parallel across configured providers and sort newest-first."""
+        alias_map = {"private": "gmail", "school": "gmail_school"}
         target_names = (
-            [p.lower().strip() for p in providers]
+            [alias_map.get(p.lower().strip(), p.lower().strip()) for p in providers]
             if providers
             else list(self._providers.keys())
         )

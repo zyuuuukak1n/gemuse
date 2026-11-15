@@ -1,16 +1,36 @@
 "use client";
 
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { BookOpen, Paperclip, Sparkles, User } from "lucide-react";
+import { BookOpen, ExternalLink, Paperclip, Sparkles, User } from "lucide-react";
 import type { ApprovalCardData, ChatMessage } from "@/types/gemuse";
 import { ApprovalCard } from "./ApprovalCard";
+import { extractGoogleFileLinks, GoogleFileCard } from "./GoogleFileCard";
 import { ThinkingAccordion } from "./ThinkingAccordion";
 
 interface MessageBubbleProps {
   message: ChatMessage;
   onApprovalUpdate?: (messageId: string, updated: ApprovalCardData) => void;
 }
+
+const markdownComponents: Components = {
+  a: ({ href, children, ...props }) => {
+    const safeHref = typeof href === "string" ? href : undefined;
+    const isExternal = Boolean(safeHref && /^https?:\/\//i.test(safeHref));
+    return (
+      <a
+        href={safeHref}
+        target={isExternal ? "_blank" : undefined}
+        rel={isExternal ? "noopener noreferrer" : undefined}
+        className="inline-flex items-center gap-1 font-medium text-emerald-700 underline decoration-emerald-500/40 underline-offset-2 transition hover:text-emerald-600 dark:text-emerald-400 dark:hover:text-emerald-300"
+        {...props}
+      >
+        <span>{children}</span>
+        {isExternal ? <ExternalLink className="inline h-3 w-3 shrink-0" strokeWidth={1.75} /> : null}
+      </a>
+    );
+  },
+};
 
 export function MessageBubble({ message, onApprovalUpdate }: MessageBubbleProps) {
   const isUser = message.role === "user";
@@ -55,7 +75,9 @@ export function MessageBubble({ message, onApprovalUpdate }: MessageBubbleProps)
 
         {message.content ? (
           <div className="prose prose-sm max-w-none break-words text-slate-800 dark:prose-invert dark:text-slate-100 prose-pre:overflow-x-auto prose-pre:rounded-xl prose-pre:border prose-pre:border-slate-800 prose-pre:bg-slate-950 prose-pre:p-3 prose-code:text-emerald-600 dark:prose-code:text-emerald-400">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents}>
+              {message.content}
+            </ReactMarkdown>
           </div>
         ) : message.is_streaming ? (
           <div className="flex items-center gap-1.5 py-1 text-xs text-slate-400">
@@ -63,6 +85,23 @@ export function MessageBubble({ message, onApprovalUpdate }: MessageBubbleProps)
             <span>応答を生成しています...</span>
           </div>
         ) : null}
+
+        {(() => {
+          const googleFiles = message.content ? extractGoogleFileLinks(message.content) : [];
+          if (googleFiles.length === 0) return null;
+          return (
+            <div className="space-y-2 pt-1" data-testid="google-file-card-list">
+              {googleFiles.map((item) => (
+                <GoogleFileCard
+                  key={item.url}
+                  url={item.url}
+                  title={item.title}
+                  accountLabel={item.accountLabel}
+                />
+              ))}
+            </div>
+          );
+        })()}
 
         {message.approval ? (
           <ApprovalCard

@@ -92,6 +92,37 @@ def _extract_slides_text(presentation: dict[str, Any]) -> list[dict[str, Any]]:
     return extracted
 
 
+def _build_google_web_url(file_id: str, mime_type: str = "") -> str:
+    """Return canonical Google Workspace web URL matching a Drive MIME type."""
+    if mime_type == "application/vnd.google-apps.document":
+        return f"https://docs.google.com/document/d/{file_id}/edit"
+    if mime_type == "application/vnd.google-apps.spreadsheet":
+        return f"https://docs.google.com/spreadsheets/d/{file_id}/edit"
+    if mime_type == "application/vnd.google-apps.presentation":
+        return f"https://docs.google.com/presentation/d/{file_id}/edit"
+    if mime_type == "application/vnd.google-apps.folder":
+        return f"https://drive.google.com/drive/folders/{file_id}"
+    return f"https://drive.google.com/file/d/{file_id}/view"
+
+
+def _build_preview_slides(slides: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build compact title + summary previews for each slide."""
+    previews: list[dict[str, Any]] = []
+    for slide in slides:
+        texts = slide.get("texts") or []
+        title_text = texts[0] if texts else ""
+        body_summary = " / ".join(texts[1:]) if len(texts) > 1 else ""
+        previews.append(
+            {
+                "slide_number": slide.get("slide_number", len(previews) + 1),
+                "object_id": slide.get("object_id", ""),
+                "title": title_text,
+                "summary": body_summary or title_text or "(空スライド)",
+            }
+        )
+    return previews
+
+
 def _build_create_slide_requests(
     title: str,
     body: str,
@@ -713,8 +744,13 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         lines: list[str] = []
         for acct, files in per_account:
             for f in files:
+                fid = f.get("id", "")
+                mime = f.get("mimeType", "")
+                web_link = f.get("webViewLink") or _build_google_web_url(fid, mime)
                 lines.append(
-                    f"- [{acct}] [MCP: drive] {f.get('name')} (id={f.get('id')}, mime={f.get('mimeType')}, modified={f.get('modifiedTime', '')})"
+                    f"- [{acct}] [MCP: drive] {f.get('name')} "
+                    f"(id={fid}, mime={mime}, modified={f.get('modifiedTime', '')}, "
+                    f"webViewLink={web_link}, url={web_link})"
                 )
 
         if not lines:
@@ -737,7 +773,7 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             meta_resp = await client.get(
                 f"https://www.googleapis.com/drive/v3/files/{file_id}",
                 headers=auth_headers,
-                params={"fields": "id, name, mimeType"},
+                params={"fields": "id, name, mimeType, webViewLink"},
             )
             meta_resp.raise_for_status()
             meta = meta_resp.json()
@@ -758,7 +794,11 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             content_resp.raise_for_status()
             text = content_resp.text
 
-        header = f"[{acct}] [MCP: drive] {meta.get('name', file_id)} (id={file_id})\n"
+        web_link = meta.get("webViewLink") or _build_google_web_url(file_id, mime_type)
+        header = (
+            f"[{acct}] [MCP: drive] {meta.get('name', file_id)} "
+            f"(id={file_id}, url={web_link})\n"
+        )
         return wrap_untrusted_data(f"google_drive:{file_id}", header + text)
 
     async def drive_create_folder(
@@ -787,7 +827,17 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             resp.raise_for_status()
             created = resp.json()
 
-        result = {"citation": "[MCP: drive]", "status": "created", "account": acct, **created}
+        folder_id = created.get("id", "")
+        mime_type = created.get("mimeType") or "application/vnd.google-apps.folder"
+        web_link = created.get("webViewLink") or _build_google_web_url(folder_id, mime_type)
+        result = {
+            "citation": "[MCP: drive]",
+            "status": "created",
+            "account": acct,
+            **created,
+            "webViewLink": web_link,
+            "url": web_link,
+        }
         return wrap_untrusted_data("google_drive:create_folder", json.dumps(result, ensure_ascii=False))
 
     async def drive_move_or_rename(
@@ -800,7 +850,7 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
     ) -> str:
         """Rename and/or move a Google Drive file between folders."""
         acct = self._resolve_single_account(account)
-        params: dict[str, str] = {"fields": "id, name, parents, webViewLink"}
+        params: dict[str, str] = {"fields": "id, name, mimeType, parents, webViewLink"}
         if add_parent_id:
             params["addParents"] = add_parent_id
         if remove_parent_id:
@@ -820,12 +870,41 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             resp.raise_for_status()
             updated = resp.json()
 
-        result = {"citation": "[MCP: drive]", "status": "updated", "account": acct, **updated}
+        fid = updated.get("id", file_id)
+        web_link = updated.get("webViewLink") or _build_google_web_url(fid, updated.get("mimeType", ""))
+        result = {
+            "citation": "[MCP: drive]",
+            "status": "updated",
+            "account": acct,
+            **updated,
+            "webViewLink": web_link,
+            "url": web_link,
+        }
         return wrap_untrusted_data("google_drive:move_or_rename", json.dumps(result, ensure_ascii=False))
 
     # ------------------------------------------------------------------
     # Google Docs v1
     # ------------------------------------------------------------------
+
+    async def _fetch_doc_preview_text(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        document_id: str,
+        fallback_text: str = "",
+    ) -> str:
+        """Fetch latest document text and return the first 500 characters."""
+        try:
+            resp = await client.get(
+                f"https://docs.googleapis.com/v1/documents/{document_id}",
+                headers=headers,
+            )
+            resp.raise_for_status()
+            return _extract_docs_text(resp.json())[:500]
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                return fallback_text[:500]
+            raise
 
     async def docs_create_document(
         self,
@@ -865,6 +944,8 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             "account": acct,
             "document_id": doc_id,
             "title": doc.get("title", title),
+            "url": f"https://docs.google.com/document/d/{doc_id}/edit",
+            "preview_text": initial_text[:500],
         }
         return wrap_untrusted_data("google_docs:create", json.dumps(result, ensure_ascii=False))
 
@@ -873,7 +954,7 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         document_id: str,
         account: GoogleAccountName = "private",
     ) -> str:
-        """Fetch a Google Doc and return its structured plain text."""
+        """Fetch a Google Doc and return its structured plain text, URL, and preview excerpt."""
         acct = self._resolve_single_account(account)
         async with self._create_client() as client:
             token = await self._get_access_token(client, acct)
@@ -884,12 +965,19 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             resp.raise_for_status()
             doc = resp.json()
 
+        resolved_id = doc.get("documentId", document_id)
         extracted = _extract_docs_text(doc)
-        header = (
-            f"[{acct}] [MCP: docs] {doc.get('title', document_id)} "
-            f"(document_id={doc.get('documentId', document_id)}, rev={doc.get('revisionId', '')})\n"
-        )
-        return wrap_untrusted_data(f"google_docs:{document_id}", header + extracted)
+        result = {
+            "citation": "[MCP: docs]",
+            "account": acct,
+            "document_id": resolved_id,
+            "title": doc.get("title", document_id),
+            "revision_id": doc.get("revisionId", ""),
+            "url": f"https://docs.google.com/document/d/{resolved_id}/edit",
+            "preview_text": extracted[:500],
+            "content": extracted,
+        }
+        return wrap_untrusted_data(f"google_docs:{document_id}", json.dumps(result, ensure_ascii=False))
 
     async def docs_append_text(
         self,
@@ -901,9 +989,10 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         acct = self._resolve_single_account(account)
         async with self._create_client() as client:
             token = await self._get_access_token(client, acct)
+            headers = {"Authorization": f"Bearer {token}"}
             resp = await client.post(
                 f"https://docs.googleapis.com/v1/documents/{document_id}:batchUpdate",
-                headers={"Authorization": f"Bearer {token}"},
+                headers=headers,
                 json={
                     "requests": [
                         {
@@ -917,12 +1006,18 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             )
             resp.raise_for_status()
             data = resp.json()
+            doc_id = data.get("documentId", document_id)
+            preview_text = await self._fetch_doc_preview_text(
+                client, headers, doc_id, fallback_text=text
+            )
 
         result = {
             "citation": "[MCP: docs]",
             "status": "appended",
             "account": acct,
-            "document_id": data.get("documentId", document_id),
+            "document_id": doc_id,
+            "url": f"https://docs.google.com/document/d/{doc_id}/edit",
+            "preview_text": preview_text,
         }
         return wrap_untrusted_data("google_docs:append", json.dumps(result, ensure_ascii=False))
 
@@ -938,9 +1033,10 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         acct = self._resolve_single_account(account)
         async with self._create_client() as client:
             token = await self._get_access_token(client, acct)
+            headers = {"Authorization": f"Bearer {token}"}
             resp = await client.post(
                 f"https://docs.googleapis.com/v1/documents/{document_id}:batchUpdate",
-                headers={"Authorization": f"Bearer {token}"},
+                headers=headers,
                 json={
                     "requests": [
                         {
@@ -957,6 +1053,10 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             )
             resp.raise_for_status()
             data = resp.json()
+            doc_id = data.get("documentId", document_id)
+            preview_text = await self._fetch_doc_preview_text(
+                client, headers, doc_id, fallback_text=replace_text
+            )
 
         replies = data.get("replies") or [{}]
         occurrences = (replies[0].get("replaceAllText") or {}).get("occurrencesChanged", 0)
@@ -964,8 +1064,10 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             "citation": "[MCP: docs]",
             "status": "replaced",
             "account": acct,
-            "document_id": data.get("documentId", document_id),
+            "document_id": doc_id,
+            "url": f"https://docs.google.com/document/d/{doc_id}/edit",
             "occurrences_changed": occurrences,
+            "preview_text": preview_text,
         }
         return wrap_untrusted_data("google_docs:replace", json.dumps(result, ensure_ascii=False))
 
@@ -1016,7 +1118,9 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             "spreadsheet_id": spreadsheet_id,
             "title": title,
             "sheet_name": sheet_name,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
             "updated_cells": updated_cells,
+            "preview_rows": (initial_rows or [])[:10],
         }
         return wrap_untrusted_data("google_sheets:create", json.dumps(result, ensure_ascii=False))
 
@@ -1038,12 +1142,15 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             resp.raise_for_status()
             data = resp.json()
 
+        values = data.get("values") or []
         payload = {
             "citation": "[MCP: sheets]",
             "account": acct,
             "spreadsheet_id": spreadsheet_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
             "range": data.get("range", range_a1),
-            "values": data.get("values") or [],
+            "values": values,
+            "preview_rows": values[:10],
         }
         return wrap_untrusted_data("google_sheets:read", json.dumps(payload, ensure_ascii=False))
 
@@ -1068,14 +1175,17 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             resp.raise_for_status()
             data = resp.json()
 
+        sp_id = data.get("spreadsheetId", spreadsheet_id)
         updates = data.get("updates") or {}
         result = {
             "citation": "[MCP: sheets]",
             "status": "appended",
             "account": acct,
-            "spreadsheet_id": data.get("spreadsheetId", spreadsheet_id),
+            "spreadsheet_id": sp_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{sp_id}/edit",
             "updated_range": updates.get("updatedRange", range_a1),
             "updated_rows": updates.get("updatedRows", len(rows)),
+            "preview_rows": rows[:10],
         }
         return wrap_untrusted_data("google_sheets:append", json.dumps(result, ensure_ascii=False))
 
@@ -1100,13 +1210,16 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             resp.raise_for_status()
             data = resp.json()
 
+        sp_id = data.get("spreadsheetId", spreadsheet_id)
         result = {
             "citation": "[MCP: sheets]",
             "status": "updated",
             "account": acct,
-            "spreadsheet_id": data.get("spreadsheetId", spreadsheet_id),
+            "spreadsheet_id": sp_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{sp_id}/edit",
             "updated_range": data.get("updatedRange", range_a1),
             "updated_cells": data.get("updatedCells", 0),
+            "preview_rows": values[:10],
         }
         return wrap_untrusted_data("google_sheets:update", json.dumps(result, ensure_ascii=False))
 
@@ -1147,13 +1260,28 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
                 )
                 batch_resp.raise_for_status()
 
+        preview_slides: list[dict[str, Any]] = []
+        if initial_slide_title or initial_slide_body:
+            preview_slides.append(
+                {
+                    "slide_number": 1,
+                    "object_id": created_slide_id or "",
+                    "title": initial_slide_title,
+                    "summary": initial_slide_body or initial_slide_title,
+                }
+            )
+        elif pres.get("slides"):
+            preview_slides = _build_preview_slides(_extract_slides_text(pres))
+
         result = {
             "citation": "[MCP: slides]",
             "status": "created",
             "account": acct,
             "presentation_id": pres_id,
             "title": pres.get("title", title),
+            "url": f"https://docs.google.com/presentation/d/{pres_id}/edit",
             "initial_slide_id": created_slide_id,
+            "preview_slides": preview_slides,
         }
         return wrap_untrusted_data("google_slides:create", json.dumps(result, ensure_ascii=False))
 
@@ -1162,7 +1290,7 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         presentation_id: str,
         account: GoogleAccountName = "private",
     ) -> str:
-        """Fetch a Google Slides presentation and return text across all slides."""
+        """Fetch a Google Slides presentation and return URL + structured slide previews."""
         acct = self._resolve_single_account(account)
         async with self._create_client() as client:
             token = await self._get_access_token(client, acct)
@@ -1173,14 +1301,18 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
             resp.raise_for_status()
             pres = resp.json()
 
+        resolved_id = pres.get("presentationId", presentation_id)
         slides = _extract_slides_text(pres)
-        lines = [
-            f"[{acct}] [MCP: slides] {pres.get('title', presentation_id)} (presentation_id={presentation_id})"
-        ]
-        for s in slides:
-            body_text = " / ".join(s["texts"]) if s["texts"] else "(空スライド)"
-            lines.append(f"- Slide {s['slide_number']} ({s['object_id']}): {body_text}")
-        return wrap_untrusted_data(f"google_slides:{presentation_id}", "\n".join(lines))
+        result = {
+            "citation": "[MCP: slides]",
+            "account": acct,
+            "presentation_id": resolved_id,
+            "title": pres.get("title", presentation_id),
+            "url": f"https://docs.google.com/presentation/d/{resolved_id}/edit",
+            "preview_slides": _build_preview_slides(slides),
+            "slides": slides,
+        }
+        return wrap_untrusted_data(f"google_slides:{presentation_id}", json.dumps(result, ensure_ascii=False))
 
     async def slides_add_slide(
         self,
@@ -1192,21 +1324,46 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         """Append a new TITLE_AND_BODY slide to a Google Slides presentation."""
         acct = self._resolve_single_account(account)
         slide_id, reqs = _build_create_slide_requests(title, body)
+        preview_slides: list[dict[str, Any]] = []
         async with self._create_client() as client:
             token = await self._get_access_token(client, acct)
+            headers = {"Authorization": f"Bearer {token}"}
             resp = await client.post(
                 f"https://slides.googleapis.com/v1/presentations/{presentation_id}:batchUpdate",
-                headers={"Authorization": f"Bearer {token}"},
+                headers=headers,
                 json={"requests": reqs},
             )
             resp.raise_for_status()
+
+            try:
+                get_resp = await client.get(
+                    f"https://slides.googleapis.com/v1/presentations/{presentation_id}",
+                    headers=headers,
+                )
+                get_resp.raise_for_status()
+                preview_slides = _build_preview_slides(_extract_slides_text(get_resp.json()))
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 404:
+                    raise
+
+        if not any(s.get("object_id") == slide_id for s in preview_slides):
+            preview_slides.append(
+                {
+                    "slide_number": len(preview_slides) + 1,
+                    "object_id": slide_id,
+                    "title": title,
+                    "summary": body or title or "(空スライド)",
+                }
+            )
 
         result = {
             "citation": "[MCP: slides]",
             "status": "slide_added",
             "account": acct,
             "presentation_id": presentation_id,
+            "url": f"https://docs.google.com/presentation/d/{presentation_id}/edit",
             "slide_id": slide_id,
+            "preview_slides": preview_slides,
         }
         return wrap_untrusted_data("google_slides:add_slide", json.dumps(result, ensure_ascii=False))
 

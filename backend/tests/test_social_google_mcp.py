@@ -307,10 +307,12 @@ async def test_google_dual_account_parallel_read_and_default_private_protection(
     )
     assert [ev["account"] for ev in structured] == ["school", "private"]
 
-    # 2. Drive search across both accounts
+    # 2. Drive search across both accounts (includes webViewLink fallback)
     drive_out = await connector.drive_search_files("Notes")
     assert "[private] [MCP: drive] private-Notes.txt" in drive_out
     assert "[school] [MCP: drive] school-Notes.txt" in drive_out
+    assert "webViewLink=https://drive.google.com/file/d/private-f1/view" in drive_out
+    assert "webViewLink=https://drive.google.com/file/d/school-f1/view" in drive_out
 
     # 3. Creation defaults strictly to private account
     async with db_session_factory() as db:
@@ -353,6 +355,7 @@ async def test_google_dual_account_parallel_read_and_default_private_protection(
 
     fld_out = await connector.drive_create_folder("Research")
     assert '"account": "private"' in fld_out
+    assert '"webViewLink": "https://drive.google.com/drive/folders/fld-1"' in fld_out
     assert drive_ops[0] == ("create_folder", "private", "Research")
 
     move_out = await connector.drive_move_or_rename("f-1", new_name="Syllabus", account="school")
@@ -572,34 +575,77 @@ async def test_google_docs_sheets_slides_tasks_contacts_and_maps(
         "maps_compute_route",
     }.issubset(tool_names)
 
-    # Docs lifecycle (default private)
-    doc_create = await connector.docs_create_document("Lab Report", initial_text="Intro line\n")
+    # Docs lifecycle (default private) + url & preview_text (<= 500 chars)
+    long_intro = "A" * 620
+    doc_create = await connector.docs_create_document("Lab Report", initial_text=long_intro)
     assert '"document_id": "doc-1"' in doc_create
     assert '"account": "private"' in doc_create
+    assert '"url": "https://docs.google.com/document/d/doc-1/edit"' in doc_create
+    assert f'"preview_text": "{"A" * 500}"' in doc_create
+
     doc_get = await connector.docs_get_document("doc-1")
     assert "[MCP: docs]" in doc_get
     assert "ColA | ValB" in doc_get
-    assert '"status": "appended"' in await connector.docs_append_text("doc-1", "More")
+    assert '"url": "https://docs.google.com/document/d/doc-1/edit"' in doc_get
+    assert '"preview_text":' in doc_get
+
+    doc_append = await connector.docs_append_text("doc-1", "More")
+    assert '"status": "appended"' in doc_append
+    assert '"url": "https://docs.google.com/document/d/doc-1/edit"' in doc_append
+    assert '"preview_text":' in doc_append
+
     rep_out = await connector.docs_replace_text("doc-1", "Intro", "Summary")
     assert '"occurrences_changed": 2' in rep_out
+    assert '"url": "https://docs.google.com/document/d/doc-1/edit"' in rep_out
+    assert '"preview_text":' in rep_out
 
-    # Sheets lifecycle
+    # Sheets lifecycle + url & preview_rows (<= 10 rows)
+    twelve_rows = [["Row", idx] for idx in range(12)]
     sh_create = await connector.sheets_create_spreadsheet(
-        "Scores", sheet_name="Grades", initial_rows=[["Name", "Score"], ["Taro", 95]]
+        "Scores", sheet_name="Grades", initial_rows=twelve_rows
     )
     assert '"spreadsheet_id": "sh-1"' in sh_create
+    assert '"url": "https://docs.google.com/spreadsheets/d/sh-1/edit"' in sh_create
     assert '"updated_cells": 4' in sh_create
-    assert '"Taro"' in await connector.sheets_read_range("sh-1", "Grades!A1:B2")
-    assert '"updated_rows": 1' in await connector.sheets_append_rows("sh-1", "Grades!A1:B2", [["Hanako", 98]])
-    assert '"status": "updated"' in await connector.sheets_update_values("sh-1", "Grades!A1:B2", [["A", "B"]])
+    sh_create_json = json.loads(
+        sh_create.split(">\n", 1)[1].rsplit("\n</untrusted_external_data>", 1)[0]
+    )
+    assert len(sh_create_json["preview_rows"]) == 10
 
-    # Slides lifecycle
+    sh_read = await connector.sheets_read_range("sh-1", "Grades!A1:B2")
+    assert '"Taro"' in sh_read
+    assert '"url": "https://docs.google.com/spreadsheets/d/sh-1/edit"' in sh_read
+    assert '"preview_rows": [["Name", "Score"], ["Taro", "95"]]' in sh_read
+
+    sh_append = await connector.sheets_append_rows("sh-1", "Grades!A1:B2", [["Hanako", 98]])
+    assert '"updated_rows": 1' in sh_append
+    assert '"url": "https://docs.google.com/spreadsheets/d/sh-1/edit"' in sh_append
+    assert '"preview_rows": [["Hanako", 98]]' in sh_append
+
+    sh_upd = await connector.sheets_update_values("sh-1", "Grades!A1:B2", [["A", "B"]])
+    assert '"status": "updated"' in sh_upd
+    assert '"url": "https://docs.google.com/spreadsheets/d/sh-1/edit"' in sh_upd
+    assert '"preview_rows": [["A", "B"]]' in sh_upd
+
+    # Slides lifecycle + url & preview_slides
     sl_create = await connector.slides_create_presentation(
         "Seminar Deck", initial_slide_title="Agenda", initial_slide_body="1. Intro"
     )
     assert '"presentation_id": "sl-1"' in sl_create
-    assert "Overview" in await connector.slides_get_presentation("sl-1")
-    assert '"status": "slide_added"' in await connector.slides_add_slide("sl-1", title="Next", body="Details")
+    assert '"url": "https://docs.google.com/presentation/d/sl-1/edit"' in sl_create
+    assert '"preview_slides":' in sl_create
+    assert '"title": "Agenda"' in sl_create
+
+    sl_get = await connector.slides_get_presentation("sl-1")
+    assert "Overview" in sl_get
+    assert '"url": "https://docs.google.com/presentation/d/sl-1/edit"' in sl_get
+    assert '"preview_slides":' in sl_get
+
+    sl_add = await connector.slides_add_slide("sl-1", title="Next", body="Details")
+    assert '"status": "slide_added"' in sl_add
+    assert '"url": "https://docs.google.com/presentation/d/sl-1/edit"' in sl_add
+    assert '"preview_slides":' in sl_add
+    assert '"title": "Next"' in sl_add
 
     # Tasks & Contacts across both accounts
     tasks_out = await connector.tasks_list()
