@@ -11,16 +11,19 @@ describe("MemorySyncStudio & Bookmarklet generator", () => {
     vi.restoreAllMocks();
   });
 
-  it("builds valid javascript: bookmarklet pointing at domain and ingest endpoint", () => {
+  it("builds valid CSP-safe javascript: bookmarklet using window.open and postMessage", () => {
     const code = buildGeminiBookmarklet(
       "https://gemuse.zyuuuukak1n.dev///",
       "secret-ingest-999"
     );
     expect(code.startsWith("javascript:")).toBe(true);
     expect(code).toContain("https://gemuse.zyuuuukak1n.dev");
-    expect(code).toContain("/api/sync/ingest-chat");
-    expect(code).toContain("X-Gemuse-Ingest-Token");
-    expect(code).toContain("secret-ingest-999");
+    expect(code).toContain('"/import"');
+    expect(code).toContain("window.open(");
+    expect(code).toContain("GEMUSE_IMPORT_READY");
+    expect(code).toContain("GEMUSE_IMPORT_CHAT");
+    expect(code).toContain("1500");
+    expect(code).not.toContain("secret-ingest-999");
   });
 
   it("updates generated bookmarklet dynamically in 公式Geminiブリッジ UI", async () => {
@@ -62,7 +65,9 @@ describe("MemorySyncStudio & Bookmarklet generator", () => {
     const outputBox = screen.getByLabelText("生成されたブックマークレット") as HTMLTextAreaElement;
     expect(outputBox.value).toContain("javascript:");
     expect(outputBox.value).toContain("https://custom.example.dev");
-    expect(outputBox.value).toContain("tok-ui-777");
+    expect(outputBox.value).toContain('"/import"');
+    expect(outputBox.value).toContain("GEMUSE_IMPORT_CHAT");
+    expect(window.localStorage.getItem("gemuse_ingest_token")).toBe("tok-ui-777");
   });
 });
 

@@ -26,21 +26,15 @@ import type {
 
 export function buildGeminiBookmarklet(
   domainInput: string,
-  ingestTokenInput: string
+  _ingestTokenInput = ""
 ): string {
   const cleanDomain = (domainInput || "https://gemuse.zyuuuukak1n.dev")
     .trim()
     .replace(/\/+$/, "");
-  const cleanToken = (ingestTokenInput || "CHANGE_ME_INGEST_TOKEN").trim();
 
   const innerCode = `
-(async function(){
+(function(){
   var domain=${JSON.stringify(cleanDomain)};
-  var token=${JSON.stringify(cleanToken)};
-  if(!token || token==="CHANGE_ME_INGEST_TOKEN"){
-    token=window.prompt("Gemuse X-Gemuse-Ingest-Token を入力してください:")||"";
-  }
-  if(!token){return;}
   var turns=[];
   var nodes=document.querySelectorAll("user-query,model-response,[data-message-author-role]");
   nodes.forEach(function(n){
@@ -55,16 +49,20 @@ export function buildGeminiBookmarklet(
     messages:turns.length>0?turns.slice(-40):null,
     raw_text:turns.length===0?(document.body.innerText||"").slice(0,50000):null
   };
-  try{
-    var r=await fetch(domain+"/api/sync/ingest-chat",{
-      method:"POST",
-      headers:{"Content-Type":"application/json","X-Gemuse-Ingest-Token":token},
-      body:JSON.stringify(payload)
-    });
-    var d=await r.json();
-    if(!r.ok){alert("Gemuse取込エラー: "+(d.detail||r.status));return;}
-    alert("Gemuseへ取込完了! Episodes: "+d.episodes_saved+", Core更新: "+d.core_updates_applied);
-  }catch(e){alert("Gemuse送信失敗: "+e);}
+  var w=window.open(domain+"/import","_blank");
+  if(!w){alert("ポップアップがブロックされました。gemini.google.com のポップアップ許可を有効にして再実行してください。");return;}
+  var timer=0;
+  var onMsg=function(ev){
+    if(ev.origin===domain&&ev.data&&ev.data.type==="GEMUSE_IMPORT_READY"){
+      clearTimeout(timer);
+      window.removeEventListener("message",onMsg);
+      try{w.postMessage({type:"GEMUSE_IMPORT_CHAT",payload:payload},domain);}catch(e){}
+    }
+  };
+  window.addEventListener("message",onMsg);
+  timer=setTimeout(function(){
+    try{w.postMessage({type:"GEMUSE_IMPORT_CHAT",payload:payload},domain);}catch(e){}
+  },1500);
 })();
 `
     .replace(/\s+/g, " ")
@@ -517,13 +515,23 @@ export function MemorySyncStudio() {
                 </div>
                 <div>
                   <label className="mb-1 block text-[11px] font-medium text-slate-600 dark:text-slate-300">
-                    Ingest Token (`X-Gemuse-Ingest-Token`)
+                    Ingest Token (`X-Gemuse-Ingest-Token` / ブラウザ保存)
                   </label>
                   <input
                     type="password"
                     value={bookmarkletToken}
-                    onChange={(e) => setBookmarkletToken(e.target.value)}
-                    placeholder="未入力時は実行時にプロンプト入力"
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setBookmarkletToken(val);
+                      try {
+                        if (val.trim()) {
+                          window.localStorage.setItem("gemuse_ingest_token", val.trim());
+                        }
+                      } catch {
+                        // Ignore storage errors
+                      }
+                    }}
+                    placeholder="未入力時は /import 画面で入力・保存"
                     aria-label="Ingest Token"
                     className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-800 outline-none focus:border-emerald-500 dark:border-slate-700 dark:bg-slate-950 dark:text-slate-100"
                   />
