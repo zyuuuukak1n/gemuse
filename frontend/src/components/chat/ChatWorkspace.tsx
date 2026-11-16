@@ -1,12 +1,13 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import {
   ArrowDown,
   Briefcase,
   CalendarClock,
   FileText,
   Loader2,
+  UploadCloud,
   X,
   Youtube,
 } from "lucide-react";
@@ -14,6 +15,7 @@ import { consumeSSEStream } from "@/lib/sse-client";
 import { triggerHaptic } from "@/lib/haptics";
 import type {
   ApprovalCardData,
+  ChatAttachmentItem,
   ChatMessage,
   ConversationDetail,
   JobSummary,
@@ -114,7 +116,10 @@ export function ChatWorkspace({
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
   const [browserSessionId, setBrowserSessionId] = useState("default");
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [workspaceDragging, setWorkspaceDragging] = useState(false);
+  const [pendingDroppedFiles, setPendingDroppedFiles] = useState<File[]>([]);
 
+  const dragCounterRef = useRef(0);
   const scrollContainerRef = useRef<HTMLDivElement | null>(null);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
   const consumedPromptRef = useRef<string | null>(null);
@@ -307,7 +312,7 @@ export function ChatWorkspace({
   }, []);
 
   const handleSend = useCallback(
-    async (text: string, attachments: string[]) => {
+    async (text: string, rawAttachments: (ChatAttachmentItem | string)[] = []) => {
       abortControllerRef.current?.abort();
       const controller = new AbortController();
       abortControllerRef.current = controller;
@@ -316,11 +321,40 @@ export function ChatWorkspace({
       setSending(true);
       setShowScrollToBottom(false);
 
+      const attachmentNames: string[] = [];
+      const attachmentPreviews: Record<string, string> = {};
+      const inlineAttachments: Array<{
+        filename: string;
+        mime_type: string;
+        data_base64: string;
+      }> = [];
+
+      for (const item of rawAttachments) {
+        if (typeof item === "string") {
+          attachmentNames.push(item);
+        } else {
+          const displayName = item.uploaded_filename || item.filename;
+          attachmentNames.push(displayName);
+          if (item.preview_url) {
+            attachmentPreviews[displayName] = item.preview_url;
+          }
+          if (item.data_base64 && item.mime_type) {
+            inlineAttachments.push({
+              filename: displayName,
+              mime_type: item.mime_type,
+              data_base64: item.data_base64,
+            });
+          }
+        }
+      }
+
       const userMsg: ChatMessage = {
         id: createTempId("user"),
         role: "user",
         content: text,
-        attachments,
+        attachments: attachmentNames,
+        attachment_previews:
+          Object.keys(attachmentPreviews).length > 0 ? attachmentPreviews : undefined,
         created_at: new Date().toISOString(),
       };
 
@@ -348,7 +382,8 @@ export function ChatWorkspace({
             conversation_id: activeConversationId,
             thinking_level: thinkingLevel,
             mode: backgroundMode ? "background" : "sse",
-            attachments,
+            attachments: attachmentNames,
+            inline_attachments: inlineAttachments,
           }),
         });
 
@@ -566,6 +601,28 @@ export function ChatWorkspace({
     ]
   );
 
+  const restoreAttachmentsFromMessage = useCallback(
+    (msg: ChatMessage): (ChatAttachmentItem | string)[] => {
+      return (msg.attachments || []).map((name) => {
+        const preview = msg.attachment_previews?.[name];
+        if (preview && preview.startsWith("data:") && preview.includes(",")) {
+          const [header, b64] = preview.split(",", 2);
+          const mime = header.slice(5).split(";")[0] || "application/octet-stream";
+          return {
+            id: `restored-${name}`,
+            filename: name,
+            mime_type: mime,
+            data_base64: b64,
+            preview_url: preview,
+            uploaded_filename: name,
+          };
+        }
+        return name;
+      });
+    },
+    []
+  );
+
   const handleRegenerateMessage = useCallback(
     (assistantMessageId: string) => {
       if (sending) return;
@@ -583,9 +640,9 @@ export function ChatWorkspace({
       if (prevUserIdx < 0) return;
       const userMsg = current[prevUserIdx];
       setMessages(current.slice(0, prevUserIdx));
-      void handleSend(userMsg.content, userMsg.attachments || []);
+      void handleSend(userMsg.content, restoreAttachmentsFromMessage(userMsg));
     },
-    [handleSend, sending]
+    [handleSend, restoreAttachmentsFromMessage, sending]
   );
 
   const handleEditResendMessage = useCallback(
@@ -598,10 +655,41 @@ export function ChatWorkspace({
       if (targetIdx < 0) return;
       const targetMsg = current[targetIdx];
       setMessages(current.slice(0, targetIdx));
-      void handleSend(trimmed, targetMsg.attachments || []);
+      void handleSend(trimmed, restoreAttachmentsFromMessage(targetMsg));
     },
-    [handleSend, sending]
+    [handleSend, restoreAttachmentsFromMessage, sending]
   );
+
+  const handleWorkspaceDragEnter = useCallback((e: DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    dragCounterRef.current += 1;
+    setWorkspaceDragging(true);
+  }, []);
+
+  const handleWorkspaceDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    setWorkspaceDragging(true);
+  }, []);
+
+  const handleWorkspaceDragLeave = useCallback((e: DragEvent<HTMLDivElement>) => {
+    if (!e.dataTransfer?.types?.includes("Files")) return;
+    e.preventDefault();
+    dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+    if (dragCounterRef.current === 0) {
+      setWorkspaceDragging(false);
+    }
+  }, []);
+
+  const handleWorkspaceDrop = useCallback((e: DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    dragCounterRef.current = 0;
+    setWorkspaceDragging(false);
+    if (e.dataTransfer?.files?.length) {
+      setPendingDroppedFiles(Array.from(e.dataTransfer.files));
+    }
+  }, []);
 
   // Trigger handoff prompt passed from CommandDashboard
   useEffect(() => {
@@ -619,8 +707,23 @@ export function ChatWorkspace({
 
   return (
     <div className="relative flex h-full w-full overflow-hidden">
-      {/* Center Chat Area */}
-      <div className="relative flex min-w-0 flex-1 flex-col bg-slate-50 dark:bg-slate-950">
+      {/* Center Chat Area (with full-area D&D drop support) */}
+      <div
+        onDragEnter={handleWorkspaceDragEnter}
+        onDragOver={handleWorkspaceDragOver}
+        onDragLeave={handleWorkspaceDragLeave}
+        onDrop={handleWorkspaceDrop}
+        className="relative flex min-w-0 flex-1 flex-col bg-slate-50 dark:bg-slate-950"
+      >
+        {workspaceDragging ? (
+          <div
+            data-testid="workspace-drop-overlay"
+            className="pointer-events-none absolute inset-3 z-40 flex flex-col items-center justify-center gap-2 rounded-3xl border-2 border-dashed border-emerald-500 bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+          >
+            <UploadCloud className="h-10 w-10" strokeWidth={1.75} />
+            <p className="text-sm font-semibold">ここにドロップして画像を添付</p>
+          </div>
+        ) : null}
         {errorBanner ? (
           <div className="mx-3 mt-2.5 flex shrink-0 items-center justify-between rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2 text-xs text-rose-700 dark:border-rose-500/40 dark:bg-rose-950/40 dark:text-rose-200 sm:mx-4">
             <span>{errorBanner}</span>
@@ -722,6 +825,8 @@ export function ChatWorkspace({
           sending={sending}
           onSend={handleSend}
           onStop={handleStopGeneration}
+          droppedFiles={pendingDroppedFiles}
+          onConsumeDroppedFiles={() => setPendingDroppedFiles([])}
         />
       </div>
 

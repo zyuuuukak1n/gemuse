@@ -611,3 +611,238 @@ servers:
     assert "最新: ES提出済み" in out
     assert "古いメッセージ 1 件を省略" in out
 
+
+async def test_discord_omnipotent_forum_thread_and_message_operations(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    perm_file = tmp_path / "discord_permissions_ops.yaml"
+    perm_file.write_text(
+        """
+version: "1.0.0"
+default_policy: disabled
+servers:
+  - guild_id: "5001"
+    name: "就活管理"
+    permission: "read_write"
+    allowed_channels: []
+  - guild_id: "5002"
+    name: "閲覧のみ"
+    permission: "read_only"
+    allowed_channels: []
+""",
+        encoding="utf-8",
+    )
+
+    api_calls: list[tuple[str, str, dict | str]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        raw_body = request.content.decode("utf-8", errors="ignore")
+        parsed: dict | str = json.loads(raw_body) if raw_body else ""
+        api_calls.append((request.method, request.url.raw_path.decode("ascii"), parsed))
+
+        if path == "/api/v10/channels/6001":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "6001",
+                    "name": "企業別フォーラム",
+                    "type": 15,
+                    "available_tags": [
+                        {"id": "tag-senko", "name": "選考中", "emoji_name": "🎯"},
+                        {"id": "tag-first", "name": "一次面接予定", "emoji_name": ""},
+                        {"id": "tag-end", "name": "辞退・終了", "emoji_name": "🏁"},
+                    ],
+                },
+            )
+        if path == "/api/v10/guilds/5001/threads/active":
+            return httpx.Response(
+                200,
+                json={
+                    "threads": [
+                        {
+                            "id": "th-alpha",
+                            "parent_id": "6001",
+                            "name": "アルファ株式会社",
+                            "applied_tags": ["tag-senko"],
+                        }
+                    ]
+                },
+            )
+        if path == "/api/v10/channels/6001/threads/archived/public":
+            return httpx.Response(200, json={"threads": [], "has_more": False})
+        if path == "/api/v10/channels/6001/threads" and request.method == "POST":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "th-gamma",
+                    "parent_id": "6001",
+                    "name": parsed["name"],  # type: ignore[index]
+                    "applied_tags": parsed["applied_tags"],  # type: ignore[index]
+                },
+            )
+        if path == "/api/v10/channels/th-gamma" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={"id": "th-gamma", "parent_id": "6001", "name": "ガンマ株式会社"},
+            )
+        if path == "/api/v10/channels/th-gamma" and request.method == "PATCH":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "th-gamma",
+                    "name": parsed.get("name", "ガンマ株式会社"),  # type: ignore[union-attr]
+                    "applied_tags": parsed.get("applied_tags", []),  # type: ignore[union-attr]
+                    "thread_metadata": {"archived": parsed.get("archived", False), "locked": False},  # type: ignore[union-attr]
+                },
+            )
+        if path == "/api/v10/channels/th-gamma/messages" and request.method == "POST":
+            return httpx.Response(200, json={"id": f"msg-split-{len(api_calls)}"})
+        if path == "/api/v10/channels/6002":
+            return httpx.Response(200, json={"id": "6002", "name": "general", "type": 0})
+        if path == "/api/v10/channels/6002/messages" and request.method == "POST":
+            return httpx.Response(200, json={"id": f"msg-post-{len(api_calls)}"})
+        if path == "/api/v10/channels/6002/messages/m-1" and request.method == "PATCH":
+            return httpx.Response(200, json={"id": "m-1", "content": parsed.get("content", "")})  # type: ignore[union-attr]
+        if path == "/api/v10/channels/6002/messages/m-1" and request.method == "DELETE":
+            return httpx.Response(204)
+        if path.startswith("/api/v10/channels/6002/messages/m-1/reactions/") and request.method == "PUT":
+            return httpx.Response(204)
+        if path == "/api/v10/channels/6002/pins/m-1" and request.method in ("PUT", "DELETE"):
+            return httpx.Response(204)
+        if path == "/api/v10/guilds/5001/channels" and request.method == "POST":
+            return httpx.Response(
+                200,
+                json={"id": "ch-new-forum", "name": parsed["name"], "type": parsed["type"]},  # type: ignore[index]
+            )
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    transport = httpx.MockTransport(_handler)
+    connector = DiscordMCPConnector(
+        bot_token="discord-test-bot-token",
+        permissions_path=perm_file,
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(
+            base_url="https://discord.com/api/v10",
+            transport=transport,
+        ),
+    )
+
+    registered_tools = {t.name: t for t in connector.get_tools()}
+    assert registered_tools["discord_delete_message"].requires_approval is True
+    assert registered_tools["discord_add_reaction"].requires_approval is False
+    assert "discord_create_forum_thread" in registered_tools
+    assert "discord_update_thread" in registered_tools
+    assert "discord_edit_message" in registered_tools
+    assert "discord_pin_message" in registered_tools
+    assert "discord_create_channel" in registered_tools
+
+    # 1. Duplicate thread skipped when skip_if_exists=True
+    skip_out = await connector.discord_create_forum_thread(
+        guild_id="就活管理",
+        channel_id="6001",
+        title="アルファ株式会社",
+        content="重複しないはず",
+        tags=["選考中"],
+        skip_if_exists=True,
+    )
+    assert '"skipped_existing": true' in skip_out
+    assert '"thread_id": "th-alpha"' in skip_out
+    assert not any(m == "POST" and p.endswith("/6001/threads") for m, p, _ in api_calls)
+
+    # 2. New forum thread creation resolves emoji-agnostic tag names to tag IDs
+    create_out = await connector.discord_create_forum_thread(
+        guild_id="就活管理",
+        channel_id="6001",
+        title="ガンマ株式会社",
+        content="基本情報・応募経路まとめ",
+        tags=["選考中", "一次面接"],
+        skip_if_exists=True,
+    )
+    assert '"status": "created"' in create_out
+    assert '"thread_id": "th-gamma"' in create_out
+    post_thread_call = next(
+        body for m, p, body in api_calls if m == "POST" and p == "/api/v10/channels/6001/threads"
+    )
+    assert post_thread_call["applied_tags"] == ["tag-senko", "tag-first"]  # type: ignore[index]
+
+    # read_only guild blocks forum creation
+    with pytest.raises(PermissionError, match="read_only"):
+        await connector.discord_create_forum_thread(
+            guild_id="閲覧のみ",
+            channel_id="6001",
+            title="禁止テスト",
+            content="NG",
+        )
+
+    # 3. Update thread title, tags (resolving parent forum tags), and archive
+    upd_out = await connector.discord_update_thread(
+        guild_id="就活管理",
+        thread_id="th-gamma",
+        title="ガンマ株式会社（終了）",
+        tags=["辞退・終了"],
+        archived=True,
+    )
+    assert '"status": "updated"' in upd_out
+    assert '"archived": true' in upd_out
+    patch_th = next(
+        body for m, p, body in api_calls if m == "PATCH" and p == "/api/v10/channels/th-gamma"
+    )
+    assert patch_th["applied_tags"] == ["tag-end"]  # type: ignore[index]
+    assert patch_th["archived"] is True  # type: ignore[index]
+
+    # 4. Message edit, delete (requires approval!), reaction, pin/unpin, split post, create channel
+    edit_out = await connector.discord_edit_message("就活管理", "6002", "m-1", "更新後の本文")
+    assert "メッセージ編集完了" in edit_out
+
+    with pytest.raises(ApprovalRequiredError):
+        await connector.discord_delete_message("就活管理", "6002", "m-1", approval_token="")
+
+    async with db_session_factory() as db:
+        req_del, tok_del = await approval.create_request(
+            db, action_type="discord_delete_message", payload={"message_id": "m-1"}
+        )
+        await approval.resolve_request(db, approval_id=req_del.id, decision="approved", raw_token=tok_del)
+
+        req_long, tok_long = await approval.create_request(
+            db, action_type="discord_post_message", payload={"channel_id": "6002"}
+        )
+        await approval.resolve_request(db, approval_id=req_long.id, decision="approved", raw_token=tok_long)
+
+    del_out = await connector.discord_delete_message("就活管理", "6002", "m-1", approval_token=tok_del)
+    assert "メッセージ削除完了" in del_out
+
+    react_out = await connector.discord_add_reaction("就活管理", "6002", "m-1", "✅")
+    assert "リアクション追加完了" in react_out
+    assert any(m == "PUT" and "/reactions/%E2%9C%85/@me" in p for m, p, _ in api_calls)
+
+    pin_out = await connector.discord_pin_message("就活管理", "6002", "m-1", unpin=False)
+    assert "ピン留め完了" in pin_out
+    unpin_out = await connector.discord_pin_message("就活管理", "6002", "m-1", unpin=True)
+    assert "ピン留め解除完了" in unpin_out
+
+    # Long message >2000 chars splits automatically into multiple POSTs
+    before_posts = sum(1 for m, p, _ in api_calls if m == "POST" and p == "/api/v10/channels/6002/messages")
+    split_out = await connector.discord_post_message(
+        "就活管理",
+        "6002",
+        "あ" * 2500,
+        approval_token=tok_long,
+    )
+    after_posts = sum(1 for m, p, _ in api_calls if m == "POST" and p == "/api/v10/channels/6002/messages")
+    assert after_posts - before_posts == 2
+    assert "分割送信 2件" in split_out
+
+    # Create forum channel
+    ch_out = await connector.discord_create_channel(
+        guild_id="就活管理",
+        name="インターン企業別",
+        channel_type="forum",
+        topic="サマーインターン選考管理",
+    )
+    assert '"channel_id": "ch-new-forum"' in ch_out
+    assert '"type": 15' in ch_out
+

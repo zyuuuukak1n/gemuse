@@ -389,6 +389,7 @@ async def run_agent_job(ctx: dict[str, Any], job_id: str) -> dict[str, Any]:
         tool_registry=tool_registry,
         approval_service=approval_service,
         mcp_hub=mcp_hub,
+        shared_files_dir=settings.SHARED_FILES_DIR,
     )
 
     parsed_job_id = uuid.UUID(job_id)
@@ -419,12 +420,19 @@ async def run_agent_job(ctx: dict[str, Any], job_id: str) -> dict[str, Any]:
                     conv_id,
                 )
 
+        last_user_attachments: list[str] = []
+        for msg in reversed(sorted(conversation.messages or [], key=lambda m: m.created_at)):
+            if msg.role == "user":
+                last_user_attachments = list(msg.attachments or [])
+                break
+
         async for _event in orchestrator.stream_chat(
             db,
             conversation=conversation,
             job=job,
             user_prompt=job.prompt,
             requested_thinking_level=job.thinking_level,  # type: ignore[arg-type]
+            attachments=last_user_attachments,
             persist_user_message=False,
             post_turn_hook=_post_turn,
         ):

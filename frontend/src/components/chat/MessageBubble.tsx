@@ -31,6 +31,15 @@ interface MessageBubbleProps {
   onEditResend?: (messageId: string, newContent: string) => Promise<void> | void;
 }
 
+const IMAGE_FILENAME_RE = /\.(png|jpe?g|gif|webp|bmp|svg|heic|heif)$/i;
+
+function isImageAttachment(filename: string, previewUrl?: string): boolean {
+  if (previewUrl && previewUrl.startsWith("data:image/")) {
+    return true;
+  }
+  return IMAGE_FILENAME_RE.test(filename);
+}
+
 function extractNodeText(node: ReactNode): string {
   if (typeof node === "string" || typeof node === "number") {
     return String(node);
@@ -111,6 +120,7 @@ export function MessageBubble({
   const [speaking, setSpeaking] = useState(false);
   const [editing, setEditing] = useState(false);
   const [editDraft, setEditDraft] = useState(message.content);
+  const [enlargedImage, setEnlargedImage] = useState<{ src: string; alt: string } | null>(null);
   const copyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
@@ -212,20 +222,49 @@ export function MessageBubble({
             </div>
           ) : (
             <div className="max-w-[85%] rounded-2xl rounded-tr-sm bg-emerald-600 px-4 py-3 text-sm text-white shadow-sm md:max-w-[75%]">
-              <p className="whitespace-pre-wrap leading-relaxed">{message.content}</p>
               {message.attachments && message.attachments.length > 0 ? (
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {message.attachments.map((file) => (
-                    <span
-                      key={file}
-                      className="inline-flex items-center gap-1 rounded-lg bg-emerald-700/70 px-2 py-0.5 text-[11px]"
-                    >
-                      <Paperclip className="h-3 w-3" strokeWidth={1.75} />
-                      {file}
-                    </span>
-                  ))}
+                <div
+                  data-testid="user-message-attachments"
+                  className="mb-2 flex flex-wrap gap-2"
+                >
+                  {message.attachments.map((file) => {
+                    const previewUrl = message.attachment_previews?.[file];
+                    const imageSrc = isImageAttachment(file, previewUrl)
+                      ? previewUrl || `/api/proxy/browser/uploads/${encodeURIComponent(file)}`
+                      : null;
+
+                    if (imageSrc) {
+                      return (
+                        <button
+                          key={file}
+                          type="button"
+                          onClick={() => setEnlargedImage({ src: imageSrc, alt: file })}
+                          aria-label={`${file}を拡大表示`}
+                          className="overflow-hidden rounded-xl border border-emerald-400/50 bg-emerald-700/40 transition hover:opacity-90"
+                        >
+                          {/* eslint-disable-next-line @next/next/no-img-element */}
+                          <img
+                            src={imageSrc}
+                            alt={file}
+                            className="h-24 w-24 object-cover"
+                          />
+                        </button>
+                      );
+                    }
+
+                    return (
+                      <span
+                        key={file}
+                        className="inline-flex items-center gap-1 rounded-lg bg-emerald-700/70 px-2 py-0.5 text-[11px]"
+                      >
+                        <Paperclip className="h-3 w-3" strokeWidth={1.75} />
+                        {file}
+                      </span>
+                    );
+                  })}
                 </div>
               ) : null}
+              <p className="whitespace-pre-wrap leading-relaxed">{message.content}</p>
             </div>
           )}
 
@@ -250,6 +289,36 @@ export function MessageBubble({
               <Pencil className="h-3 w-3" strokeWidth={1.75} />
               <span>編集</span>
             </button>
+          </div>
+        ) : null}
+
+        {enlargedImage ? (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={enlargedImage.alt}
+            onClick={() => setEnlargedImage(null)}
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+          >
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="relative max-h-[85vh] max-w-3xl overflow-hidden rounded-2xl border border-slate-700 bg-slate-950 shadow-2xl"
+            >
+              <button
+                type="button"
+                onClick={() => setEnlargedImage(null)}
+                aria-label="拡大画像を閉じる"
+                className="absolute right-3 top-3 z-10 flex h-10 w-10 items-center justify-center rounded-full bg-slate-900/90 text-white hover:bg-slate-800"
+              >
+                <X className="h-5 w-5" />
+              </button>
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={enlargedImage.src}
+                alt={enlargedImage.alt}
+                className="max-h-[80vh] w-auto object-contain"
+              />
+            </div>
           </div>
         ) : null}
       </div>

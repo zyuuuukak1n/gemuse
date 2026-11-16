@@ -1,12 +1,13 @@
 """Chat API: SSE real-time streaming & ARQ background job submission."""
 
+import base64
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -22,14 +23,56 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
+MAX_INLINE_ATTACHMENT_BYTES = 10 * 1024 * 1024  # 10 MiB decoded limit
+
+
+class InlineAttachment(BaseModel):
+    """Validated inline multimodal attachment payload (Base64 + MIME type)."""
+
+    filename: str = Field(..., min_length=1, max_length=255)
+    mime_type: str = Field(..., min_length=3, max_length=128)
+    data_base64: str = Field(..., min_length=1, max_length=15_000_000)
+
+    @field_validator("mime_type")
+    @classmethod
+    def _validate_mime_type(cls, value: str) -> str:
+        cleaned = value.strip().lower()
+        if "/" not in cleaned:
+            raise ValueError("Invalid mime_type format")
+        return cleaned
+
+    @field_validator("data_base64")
+    @classmethod
+    def _validate_base64(cls, value: str) -> str:
+        cleaned = value.strip()
+        if cleaned.startswith("data:") and "," in cleaned:
+            cleaned = cleaned.split(",", 1)[1].strip()
+        try:
+            decoded = base64.b64decode(cleaned, validate=True)
+        except Exception as exc:
+            raise ValueError("Invalid Base64 attachment payload") from exc
+        if len(decoded) > MAX_INLINE_ATTACHMENT_BYTES:
+            raise ValueError("Attachment exceeds 10 MiB size limit")
+        return cleaned
+
+
 class ChatRequest(BaseModel):
     """Validated payload for POST /api/chat."""
 
-    message: str = Field(..., min_length=1, max_length=32000)
+    message: str = Field(default="", max_length=32000)
     conversation_id: uuid.UUID | None = None
     thinking_level: RequestedThinkingLevel = "auto"
     mode: Literal["sse", "background"] = "sse"
     attachments: list[str] = Field(default_factory=list, max_length=20)
+    inline_attachments: list[InlineAttachment] = Field(default_factory=list, max_length=10)
+
+    @model_validator(mode="after")
+    def _ensure_message_or_attachments(self) -> "ChatRequest":
+        if not self.message.strip() and not self.attachments and not self.inline_attachments:
+            raise ValueError("Message or at least one attachment is required")
+        if not self.message.strip():
+            self.message = "添付ファイルを確認して対応してください。"
+        return self
 
 
 class BackgroundChatResponse(BaseModel):
@@ -102,13 +145,20 @@ async def chat_endpoint(
     )
     db.add(job)
 
+    merged_attachments = list(
+        dict.fromkeys(
+            [*(payload.attachments or []), *(item.filename for item in payload.inline_attachments)]
+        )
+    )
+    inline_attachment_dicts = [item.model_dump() for item in payload.inline_attachments]
+
     if payload.mode == "background":
         user_msg = Message(
             id=uuid.uuid4(),
             conversation_id=conversation.id,
             role="user",
             content=payload.message,
-            attachments=payload.attachments,
+            attachments=merged_attachments,
         )
         db.add(user_msg)
         await db.commit()
@@ -148,7 +198,8 @@ async def chat_endpoint(
                 job=job,
                 user_prompt=payload.message,
                 requested_thinking_level=payload.thinking_level,
-                attachments=payload.attachments,
+                attachments=merged_attachments,
+                inline_attachments=inline_attachment_dicts,
                 persist_user_message=True,
                 post_turn_hook=_post_turn_consolidate,
             ):

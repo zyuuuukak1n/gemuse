@@ -1,9 +1,11 @@
 """Multi-server Discord REST connector with strict YAML permission whitelisting."""
 
 import asyncio
+import json
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import quote
 
 import httpx
 import yaml
@@ -135,6 +137,101 @@ def _format_thread_tags(thread: dict[str, Any], tag_map: dict[str, str]) -> str:
     return ", ".join(resolved) if resolved else "なし"
 
 
+_CHANNEL_TYPE_NAME_TO_INT: dict[str, int] = {
+    "text": 0,
+    "voice": 2,
+    "category": 4,
+    "announcement": 5,
+    "news": 5,
+    "forum": 15,
+    "media": 16,
+}
+
+
+def _resolve_forum_tag_ids(
+    requested_tags: list[str] | None,
+    available_tags: list[dict[str, Any]],
+) -> tuple[list[str], list[str]]:
+    """
+    Resolve tag names (with or without emoji) or tag IDs against a forum's `available_tags`.
+
+    Returns `(resolved_tag_ids, resolved_tag_labels)` preserving order and deduplicating.
+    """
+    if not requested_tags or not available_tags:
+        return [], []
+
+    entries: list[tuple[str, str, str, str]] = []
+    for raw in available_tags:
+        if not isinstance(raw, dict):
+            continue
+        tid = str(raw.get("id", "")).strip()
+        name = str(raw.get("name", "")).strip()
+        emoji = str(raw.get("emoji_name") or "").strip()
+        if not tid or not name:
+            continue
+        display = f"{emoji} {name}".strip() if emoji else name
+        entries.append((tid, name.lower(), display.lower(), display))
+
+    matched_ids: list[str] = []
+    matched_labels: list[str] = []
+    seen_ids: set[str] = set()
+
+    for raw_req in requested_tags:
+        q = str(raw_req).strip().lower()
+        if not q:
+            continue
+        chosen: tuple[str, str] | None = None
+        # 1. Exact match on tag_id, plain name, or emoji+name
+        for tid, name_l, disp_l, display in entries:
+            if q in (tid.lower(), name_l, disp_l):
+                chosen = (tid, display)
+                break
+        # 2. Substring partial match (emoji-agnostic)
+        if chosen is None:
+            for tid, name_l, disp_l, display in entries:
+                if q in name_l or name_l in q or q in disp_l:
+                    chosen = (tid, display)
+                    break
+        if chosen is not None and chosen[0] not in seen_ids:
+            seen_ids.add(chosen[0])
+            matched_ids.append(chosen[0])
+            matched_labels.append(chosen[1])
+
+    return matched_ids, matched_labels
+
+
+def _split_discord_message(content: str, max_len: int = 2000) -> list[str]:
+    """Split a long Discord message into <= max_len chunks, preferring newline boundaries."""
+    if len(content) <= max_len:
+        return [content]
+    chunks: list[str] = []
+    remaining = content
+    while remaining:
+        if len(remaining) <= max_len:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n", 0, max_len)
+        if split_at <= max_len // 3:
+            split_at = remaining.rfind(" ", 0, max_len)
+        if split_at <= 0:
+            split_at = max_len
+        chunks.append(remaining[:split_at])
+        remaining = remaining[split_at:].lstrip("\n")
+    return chunks
+
+
+def _titles_match_similar(target_title: str, existing_title: str) -> bool:
+    """Detect duplicate/similar thread titles (normalized exact or >=3-char containment)."""
+    a = " ".join(target_title.replace("\u3000", " ").split()).lower()
+    b = " ".join(existing_title.replace("\u3000", " ").split()).lower()
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    return len(shorter) >= 3 and shorter in longer
+
+
 class DiscordMCPConnector(BaseMCPConnector):
     """
     Discord REST API v10 connector managing multiple servers via a single Bot token.
@@ -243,6 +340,7 @@ class DiscordMCPConnector(BaseMCPConnector):
         channel_id: str | None = None,
         *,
         require_write: bool = False,
+        parent_channel_id: str | None = None,
     ) -> GuildPermission:
         policy = self._get_guild_policy(guild_id)
         if policy.permission == "disabled":
@@ -253,10 +351,14 @@ class DiscordMCPConnector(BaseMCPConnector):
             raise PermissionError(
                 f"Discord guild '{guild_id}' is '{policy.permission}'; writes are blocked"
             )
-        if channel_id and policy.allowed_channels and str(channel_id) not in policy.allowed_channels:
-            raise PermissionError(
-                f"Discord channel '{channel_id}' is not whitelisted for guild '{guild_id}'"
-            )
+        if channel_id and policy.allowed_channels:
+            allowed_set = set(policy.allowed_channels)
+            cid_ok = str(channel_id) in allowed_set
+            parent_ok = bool(parent_channel_id and str(parent_channel_id) in allowed_set)
+            if not cid_ok and not parent_ok:
+                raise PermissionError(
+                    f"Discord channel '{channel_id}' is not whitelisted for guild '{guild_id}'"
+                )
         return policy
 
     def _create_client(self) -> httpx.AsyncClient:
@@ -756,25 +858,374 @@ class DiscordMCPConnector(BaseMCPConnector):
         channel_id: str,
         content: str,
         approval_token: str = "",
+        thread_id: str | None = None,
     ) -> str:
-        """Post a message to a read_write Discord channel (requires valid approval token)."""
-        resolved_guild_id = await self._resolve_guild_id(guild_id)
-        policy = self._check_access(resolved_guild_id, channel_id, require_write=True)
-        await self._require_approval("discord_post_message", approval_token)
-
+        """Post a message to a read_write channel or thread, splitting chunks > 2000 chars."""
+        target_id = (thread_id or channel_id).strip()
         async with self._create_client() as client:
-            resp = await client.post(
-                f"/channels/{channel_id}/messages",
-                json={"content": content},
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            parent_id: str | None = channel_id if thread_id else None
+            if parent_id is None:
+                ch_resp = await client.get(f"/channels/{target_id}")
+                if ch_resp.status_code == 200:
+                    parent_id = ch_resp.json().get("parent_id")
+            policy = self._check_access(
+                resolved_guild_id,
+                target_id,
+                require_write=True,
+                parent_channel_id=str(parent_id) if parent_id else None,
+            )
+            await self._require_approval("discord_post_message", approval_token)
+
+            chunks = _split_discord_message(content, max_len=2000)
+            created_ids: list[str] = []
+            for chunk in chunks:
+                resp = await client.post(
+                    f"/channels/{target_id}/messages",
+                    json={"content": chunk},
+                )
+                resp.raise_for_status()
+                created_ids.append(str(resp.json().get("id", "")))
+
+        guild_label = policy.name or policy.guild_id
+        msg_id = created_ids[0] if created_ids else ""
+        extra_note = f" (分割送信 {len(created_ids)}件: {', '.join(created_ids)})" if len(created_ids) > 1 else ""
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            f"[Discord: {guild_label} / #{target_id}] 投稿完了 (message_id={msg_id}){extra_note}",
+        )
+
+    async def discord_create_forum_thread(
+        self,
+        guild_id: str,
+        channel_id: str,
+        title: str,
+        content: str,
+        tags: list[str] | None = None,
+        skip_if_exists: bool = True,
+        approval_token: str = "",
+    ) -> str:
+        """Create a new Discord forum thread with resolved tag IDs and duplicate protection."""
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            policy = self._check_access(resolved_guild_id, channel_id, require_write=True)
+            if approval_token.strip():
+                await self._require_approval("discord_create_forum_thread", approval_token)
+
+            ch_resp = await client.get(f"/channels/{channel_id}")
+            ch_resp.raise_for_status()
+            forum_data = ch_resp.json() or {}
+            available_tags = forum_data.get("available_tags") or []
+            tag_map = _build_forum_tag_map(forum_data)
+
+            if skip_if_exists:
+                existing_threads = await self._collect_forum_threads(
+                    client, policy.guild_id, channel_id
+                )
+                for th in existing_threads:
+                    existing_name = str(th.get("name", ""))
+                    if _titles_match_similar(title, existing_name):
+                        result = {
+                            "citation": f"[Discord: {policy.name or policy.guild_id} / #{forum_data.get('name', channel_id)}]",
+                            "status": "skipped_existing",
+                            "skipped_existing": True,
+                            "guild_id": policy.guild_id,
+                            "channel_id": channel_id,
+                            "thread_id": str(th.get("id", "")),
+                            "title": existing_name,
+                            "tags": _format_thread_tags(th, tag_map),
+                        }
+                        return wrap_untrusted_data(
+                            f"discord:{policy.name or policy.guild_id}",
+                            json.dumps(result, ensure_ascii=False),
+                        )
+
+            tag_ids, tag_labels = _resolve_forum_tag_ids(tags, available_tags)
+            chunks = _split_discord_message(content, max_len=2000)
+            first_chunk = chunks[0] if chunks else ""
+            payload: dict[str, Any] = {
+                "name": title.strip()[:100],
+                "applied_tags": tag_ids,
+                "message": {"content": first_chunk},
+            }
+            post_resp = await client.post(f"/channels/{channel_id}/threads", json=payload)
+            post_resp.raise_for_status()
+            created_thread = post_resp.json() or {}
+            created_thread_id = str(created_thread.get("id", ""))
+
+            for extra_chunk in chunks[1:]:
+                if not created_thread_id:
+                    break
+                ext_resp = await client.post(
+                    f"/channels/{created_thread_id}/messages",
+                    json={"content": extra_chunk},
+                )
+                ext_resp.raise_for_status()
+
+        guild_label = policy.name or policy.guild_id
+        result = {
+            "citation": f"[Discord: {guild_label} / #{forum_data.get('name', channel_id)}]",
+            "status": "created",
+            "skipped_existing": False,
+            "guild_id": policy.guild_id,
+            "channel_id": channel_id,
+            "thread_id": created_thread_id,
+            "title": str(created_thread.get("name", title)),
+            "applied_tag_ids": tag_ids,
+            "applied_tags": tag_labels,
+        }
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            json.dumps(result, ensure_ascii=False),
+        )
+
+    async def discord_update_thread(
+        self,
+        guild_id: str,
+        thread_id: str,
+        title: str | None = None,
+        tags: list[str] | None = None,
+        archived: bool | None = None,
+        locked: bool | None = None,
+        approval_token: str = "",
+    ) -> str:
+        """Update thread title, forum tags, archived status, or locked state."""
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            th_resp = await client.get(f"/channels/{thread_id}")
+            th_resp.raise_for_status()
+            th_data = th_resp.json() or {}
+            parent_id = str(th_data.get("parent_id", "") or "")
+
+            policy = self._check_access(
+                resolved_guild_id,
+                thread_id,
+                require_write=True,
+                parent_channel_id=parent_id or None,
+            )
+            if approval_token.strip():
+                await self._require_approval("discord_update_thread", approval_token)
+
+            patch_payload: dict[str, Any] = {}
+            resolved_labels: list[str] = []
+            if title is not None and title.strip():
+                patch_payload["name"] = title.strip()[:100]
+            if archived is not None:
+                patch_payload["archived"] = bool(archived)
+            if locked is not None:
+                patch_payload["locked"] = bool(locked)
+            if tags is not None:
+                available_tags: list[dict[str, Any]] = []
+                if parent_id:
+                    parent_resp = await client.get(f"/channels/{parent_id}")
+                    if parent_resp.status_code == 200:
+                        available_tags = (parent_resp.json() or {}).get("available_tags") or []
+                tag_ids, resolved_labels = _resolve_forum_tag_ids(tags, available_tags)
+                patch_payload["applied_tags"] = tag_ids
+
+            if not patch_payload:
+                raise ValueError("At least one thread update field (title, tags, archived, locked) is required")
+
+            patch_resp = await client.patch(f"/channels/{thread_id}", json=patch_payload)
+            patch_resp.raise_for_status()
+            updated = patch_resp.json() or {}
+
+        guild_label = policy.name or policy.guild_id
+        result = {
+            "citation": f"[Discord: {guild_label}]",
+            "status": "updated",
+            "guild_id": policy.guild_id,
+            "thread_id": str(updated.get("id", thread_id)),
+            "title": str(updated.get("name", title or th_data.get("name", ""))),
+            "applied_tags": resolved_labels,
+            "applied_tag_ids": updated.get("applied_tags", patch_payload.get("applied_tags", [])),
+            "archived": updated.get("thread_metadata", {}).get("archived", archived),
+            "locked": updated.get("thread_metadata", {}).get("locked", locked),
+        }
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            json.dumps(result, ensure_ascii=False),
+        )
+
+    async def discord_edit_message(
+        self,
+        guild_id: str,
+        channel_id: str,
+        message_id: str,
+        content: str,
+        approval_token: str = "",
+    ) -> str:
+        """Edit an existing Discord message in a read_write channel or thread."""
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            ch_resp = await client.get(f"/channels/{channel_id}")
+            parent_id = str(ch_resp.json().get("parent_id", "")) if ch_resp.status_code == 200 else None
+            policy = self._check_access(
+                resolved_guild_id,
+                channel_id,
+                require_write=True,
+                parent_channel_id=parent_id or None,
+            )
+            if approval_token.strip():
+                await self._require_approval("discord_edit_message", approval_token)
+
+            resp = await client.patch(
+                f"/channels/{channel_id}/messages/{message_id}",
+                json={"content": content[:2000]},
             )
             resp.raise_for_status()
-            created = resp.json()
+            edited = resp.json() or {}
 
-        msg_id = created.get("id", "")
         guild_label = policy.name or policy.guild_id
         return wrap_untrusted_data(
             f"discord:{guild_label}",
-            f"[Discord: {guild_label} / #{channel_id}] 投稿完了 (message_id={msg_id})",
+            f"[Discord: {guild_label} / #{channel_id}] メッセージ編集完了 (message_id={edited.get('id', message_id)})",
+        )
+
+    async def discord_delete_message(
+        self,
+        guild_id: str,
+        channel_id: str,
+        message_id: str,
+        approval_token: str = "",
+    ) -> str:
+        """Delete a Discord message (destructive action; strictly requires valid approval token)."""
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            ch_resp = await client.get(f"/channels/{channel_id}")
+            parent_id = str(ch_resp.json().get("parent_id", "")) if ch_resp.status_code == 200 else None
+            policy = self._check_access(
+                resolved_guild_id,
+                channel_id,
+                require_write=True,
+                parent_channel_id=parent_id or None,
+            )
+            await self._require_approval("discord_delete_message", approval_token)
+
+            resp = await client.delete(f"/channels/{channel_id}/messages/{message_id}")
+            resp.raise_for_status()
+
+        guild_label = policy.name or policy.guild_id
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            f"[Discord: {guild_label} / #{channel_id}] メッセージ削除完了 (message_id={message_id})",
+        )
+
+    async def discord_add_reaction(
+        self,
+        guild_id: str,
+        channel_id: str,
+        message_id: str,
+        emoji: str,
+    ) -> str:
+        """Add an emoji reaction to a Discord message."""
+        clean_emoji = emoji.strip()
+        if not clean_emoji:
+            raise ValueError("Reaction emoji must not be empty")
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            ch_resp = await client.get(f"/channels/{channel_id}")
+            parent_id = str(ch_resp.json().get("parent_id", "")) if ch_resp.status_code == 200 else None
+            policy = self._check_access(
+                resolved_guild_id,
+                channel_id,
+                require_write=True,
+                parent_channel_id=parent_id or None,
+            )
+            encoded_emoji = quote(clean_emoji, safe="")
+            resp = await client.put(
+                f"/channels/{channel_id}/messages/{message_id}/reactions/{encoded_emoji}/@me"
+            )
+            resp.raise_for_status()
+
+        guild_label = policy.name or policy.guild_id
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            f"[Discord: {guild_label} / #{channel_id}] リアクション追加完了 ({clean_emoji}, message_id={message_id})",
+        )
+
+    async def discord_pin_message(
+        self,
+        guild_id: str,
+        channel_id: str,
+        message_id: str,
+        unpin: bool = False,
+    ) -> str:
+        """Pin or unpin a Discord message in a read_write channel."""
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            ch_resp = await client.get(f"/channels/{channel_id}")
+            parent_id = str(ch_resp.json().get("parent_id", "")) if ch_resp.status_code == 200 else None
+            policy = self._check_access(
+                resolved_guild_id,
+                channel_id,
+                require_write=True,
+                parent_channel_id=parent_id or None,
+            )
+            url = f"/channels/{channel_id}/pins/{message_id}"
+            resp = await (client.delete(url) if unpin else client.put(url))
+            resp.raise_for_status()
+
+        guild_label = policy.name or policy.guild_id
+        action_text = "ピン留め解除完了" if unpin else "ピン留め完了"
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            f"[Discord: {guild_label} / #{channel_id}] {action_text} (message_id={message_id})",
+        )
+
+    async def discord_create_channel(
+        self,
+        guild_id: str,
+        name: str,
+        channel_type: str | int = "text",
+        category_id: str = "",
+        topic: str = "",
+        approval_token: str = "",
+    ) -> str:
+        """Create a text, forum, announcement, voice, or category channel in a read_write server."""
+        if isinstance(channel_type, int):
+            type_int = channel_type
+        else:
+            raw_type = str(channel_type).strip().lower()
+            if raw_type.isdigit():
+                type_int = int(raw_type)
+            else:
+                type_int = _CHANNEL_TYPE_NAME_TO_INT.get(raw_type, 0)
+
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            policy = self._check_access(resolved_guild_id, require_write=True)
+            if approval_token.strip():
+                await self._require_approval("discord_create_channel", approval_token)
+
+            payload: dict[str, Any] = {
+                "name": name.strip()[:100],
+                "type": type_int,
+            }
+            if category_id.strip():
+                payload["parent_id"] = category_id.strip()
+            if topic.strip():
+                payload["topic"] = topic.strip()[:1024]
+
+            resp = await client.post(
+                f"/guilds/{policy.guild_id}/channels",
+                json=payload,
+            )
+            resp.raise_for_status()
+            created = resp.json() or {}
+
+        guild_label = policy.name or policy.guild_id
+        result = {
+            "citation": f"[Discord: {guild_label}]",
+            "status": "created",
+            "guild_id": policy.guild_id,
+            "channel_id": str(created.get("id", "")),
+            "name": str(created.get("name", name)),
+            "type": created.get("type", type_int),
+        }
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            json.dumps(result, ensure_ascii=False),
         )
 
     async def discord_update_pinned_summary(
@@ -844,9 +1295,65 @@ class DiscordMCPConnector(BaseMCPConnector):
             ),
             MCPTool(
                 name="discord_post_message",
-                description="Post a message to a read_write Discord channel (requires approval_token).",
+                description="Post a message to a read_write Discord channel or thread, auto-splitting >2000 chars (requires approval_token).",
                 handler=self.discord_post_message,
                 requires_approval=True,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_create_forum_thread",
+                description="Create a new thread in a read_write Discord forum channel, resolving tag names to tag IDs and checking skip_if_exists for duplicates.",
+                handler=self.discord_create_forum_thread,
+                requires_approval=False,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_update_thread",
+                description="Update an existing Discord thread's title, forum tags (by tag name), archived, or locked state in a read_write server.",
+                handler=self.discord_update_thread,
+                requires_approval=False,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_edit_message",
+                description="Edit an existing message in a read_write Discord channel or thread.",
+                handler=self.discord_edit_message,
+                requires_approval=False,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_delete_message",
+                description="Delete a message from a read_write Discord channel or thread (strictly requires approval_token).",
+                handler=self.discord_delete_message,
+                requires_approval=True,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_add_reaction",
+                description="Add an emoji reaction to a message in a read_write Discord server.",
+                handler=self.discord_add_reaction,
+                requires_approval=False,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_pin_message",
+                description="Pin or unpin a message in a read_write Discord channel.",
+                handler=self.discord_pin_message,
+                requires_approval=False,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_create_channel",
+                description="Create a new text, forum, announcement, voice, or category channel in a read_write Discord server.",
+                handler=self.discord_create_channel,
+                requires_approval=False,
                 source_type="discord",
                 already_wrapped=True,
             ),

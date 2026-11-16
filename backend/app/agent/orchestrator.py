@@ -1,12 +1,15 @@
 """Gemini 4 Hydrogen orchestrator with Function Calling loop, SSE streaming, and tool gating."""
 
 import asyncio
+import base64
 import json
+import mimetypes
 import re
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel
@@ -50,6 +53,7 @@ _SYSTEM_PROMPT_TEMPLATE = """You are Gemuse, a secure, self-hosted personal AI a
 - Google ドキュメント・スプレッドシート・スライド・Drive ファイルを作成・編集・検索した際は、生のファイルIDだけを羅列せず、**必ず `[ファイルタイトル](公式URL)` 形式の Markdown リンク**を出力すること。
 - 作成・取得したドキュメントの本文抜粋や、スプレッドシートの内容（Markdown テーブル形式）をプレビューとして本文中に見やすく提示すること。
 - Google スプレッドシートに表を作成・更新した際は、`sheets_format_table` を呼び出してネイティブテーブル化・ヘッダー装飾・罫線・列幅自動調整を適用し、見やすく仕上げること（ステータス列などの条件付き色分けが必要な場合は `sheets_apply_formatting` も併用すること）。
+- Discord フォーラムへ企業スレッドを作成する際は、必ず事前に `discord_read_history` 等で既存スレッドの体裁・記載項目・タグ体系を読み取って踏襲し、`discord_create_forum_thread` の `skip_if_exists=True` で重複作成を防ぐこと。
 - After receiving external tool results, ALWAYS produce a complete final user-facing answer in Japanese. Never end a turn with empty text.
 
 ## Layer 1: Core Memory
@@ -74,12 +78,81 @@ def extract_citations(text: str) -> list[str]:
     return ordered
 
 
+_MAX_DISK_ATTACHMENT_BYTES = 10 * 1024 * 1024
+_SUPPORTED_MULTIMODAL_PREFIXES = ("image/", "audio/", "video/", "application/pdf")
+
+
+def _load_inline_attachments_from_uploads(
+    filenames: list[str] | None,
+    shared_files_dir: str | None,
+) -> list[dict[str, Any]]:
+    """Resolve uploaded filenames under `<shared_files_dir>/uploads` into inline Base64 payloads."""
+    if not filenames or not shared_files_dir:
+        return []
+    uploads_root = (Path(shared_files_dir) / "uploads").resolve()
+    if not uploads_root.is_dir():
+        return []
+
+    resolved: list[dict[str, Any]] = []
+    for raw_name in filenames:
+        safe_name = Path(str(raw_name)).name
+        if not safe_name or safe_name in {".", ".."}:
+            continue
+        candidate = (uploads_root / safe_name).resolve()
+        if not str(candidate).startswith(str(uploads_root)) or not candidate.is_file():
+            continue
+        if candidate.stat().st_size > _MAX_DISK_ATTACHMENT_BYTES:
+            continue
+        mime_type, _ = mimetypes.guess_type(candidate.name)
+        if not mime_type or not mime_type.startswith(_SUPPORTED_MULTIMODAL_PREFIXES):
+            continue
+        raw_bytes = candidate.read_bytes()
+        resolved.append(
+            {
+                "filename": candidate.name,
+                "mime_type": mime_type,
+                "data_base64": base64.b64encode(raw_bytes).decode("ascii"),
+            }
+        )
+    return resolved
+
+
+def _merge_inline_attachments(
+    inline_attachments: list[dict[str, Any]] | None,
+    fallback_filenames: list[str] | None,
+    shared_files_dir: str | None,
+) -> list[dict[str, Any]]:
+    """Combine explicit inline Base64 attachments with uploaded disk files (deduplicated)."""
+    merged: list[dict[str, Any]] = []
+    seen_names: set[str] = set()
+
+    for att in inline_attachments or []:
+        if not isinstance(att, dict):
+            continue
+        data_b64 = str(att.get("data_base64", "")).strip()
+        mime_type = str(att.get("mime_type", "")).strip()
+        filename = str(att.get("filename", "attachment")).strip() or "attachment"
+        if not data_b64 or not mime_type:
+            continue
+        if data_b64.startswith("data:") and "," in data_b64:
+            data_b64 = data_b64.split(",", 1)[1].strip()
+        seen_names.add(filename)
+        merged.append({"filename": filename, "mime_type": mime_type, "data_base64": data_b64})
+
+    missing_names = [n for n in (fallback_filenames or []) if n not in seen_names]
+    for disk_att in _load_inline_attachments_from_uploads(missing_names, shared_files_dir):
+        merged.append(disk_att)
+
+    return merged
+
+
 def _build_sanitized_contents(
     history_messages: list[Message],
     user_prompt: str,
     persist_user_message: bool,
+    inline_attachments: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Build alternating non-empty user/assistant turns for Gemini API."""
+    """Build alternating non-empty user/assistant turns for Gemini API (with multimodal attachments)."""
     contents: list[dict[str, Any]] = []
     for m in history_messages:
         if m.role not in ("user", "assistant"):
@@ -99,6 +172,9 @@ def _build_sanitized_contents(
                 contents[-1]["content"] += f"\n\n{clean_prompt}"
         else:
             contents.append({"role": "user", "content": clean_prompt})
+
+    if inline_attachments and contents and contents[-1]["role"] == "user":
+        contents[-1]["attachments"] = list(inline_attachments)
     return contents
 
 
@@ -199,14 +275,43 @@ class GoogleGenAIStreamProvider(LLMStreamProvider):
             ]
             config_kwargs["tools"] = [types.Tool(function_declarations=declarations)]
 
-        formatted_contents = [
-            types.Content(
-                role="model" if item["role"] == "assistant" else "user",
-                parts=[types.Part.from_text(text=item["content"])],
-            )
-            for item in contents
-            if str(item.get("content", "")).strip()
-        ]
+        formatted_contents: list[Any] = []
+        for item in contents:
+            text_val = str(item.get("content", "")).strip()
+            item_attachments = item.get("attachments") or []
+            if not text_val and not item_attachments:
+                continue
+            parts: list[Any] = []
+            for att in item_attachments:
+                if not isinstance(att, dict):
+                    continue
+                mime_type = str(att.get("mime_type", "")).strip()
+                raw_b64 = str(att.get("data_base64", "")).strip()
+                if not mime_type or not raw_b64:
+                    continue
+                if raw_b64.startswith("data:") and "," in raw_b64:
+                    raw_b64 = raw_b64.split(",", 1)[1].strip()
+                try:
+                    raw_bytes = base64.b64decode(raw_b64)
+                except Exception:
+                    continue
+                if hasattr(types.Part, "from_bytes"):
+                    parts.append(types.Part.from_bytes(data=raw_bytes, mime_type=mime_type))
+                elif hasattr(types, "Blob"):
+                    parts.append(
+                        types.Part(inline_data=types.Blob(mime_type=mime_type, data=raw_bytes))
+                    )
+                else:
+                    parts.append({"inline_data": {"mime_type": mime_type, "data": raw_b64}})
+            if text_val:
+                parts.append(types.Part.from_text(text=text_val))
+            if parts:
+                formatted_contents.append(
+                    types.Content(
+                        role="model" if item["role"] == "assistant" else "user",
+                        parts=parts,
+                    )
+                )
 
         stream = await self._client.aio.models.generate_content_stream(
             model=model,
@@ -256,6 +361,7 @@ class AgentOrchestrator:
         approval_service: ApprovalService,
         mcp_hub: MCPHubManager | None = None,
         max_tool_rounds: int = 5,
+        shared_files_dir: str | None = None,
     ) -> None:
         self.model_name = model_name
         self.llm_provider = llm_provider
@@ -264,6 +370,7 @@ class AgentOrchestrator:
         self.tool_registry = mcp_hub.tool_registry if mcp_hub is not None else tool_registry
         self.approval_service = approval_service
         self.max_tool_rounds = max_tool_rounds
+        self.shared_files_dir = shared_files_dir
 
     async def _execute_tool_batch(
         self,
@@ -313,6 +420,7 @@ class AgentOrchestrator:
         user_prompt: str,
         requested_thinking_level: RequestedThinkingLevel = "auto",
         attachments: list[str] | None = None,
+        inline_attachments: list[dict[str, Any]] | None = None,
         persist_user_message: bool = True,
         post_turn_hook: PostTurnHook | None = None,
     ) -> AsyncIterator[SSEEvent]:
@@ -326,6 +434,17 @@ class AgentOrchestrator:
             history_length=len(history_messages),
         )
 
+        merged_inline_attachments = _merge_inline_attachments(
+            inline_attachments,
+            attachments,
+            self.shared_files_dir,
+        )
+        stored_attachment_names = list(
+            dict.fromkeys(
+                [*(attachments or []), *(att["filename"] for att in merged_inline_attachments)]
+            )
+        )
+
         job.thinking_level = decision.level
         job.status = "running"
         if persist_user_message:
@@ -333,7 +452,7 @@ class AgentOrchestrator:
                 conversation_id=conversation.id,
                 role="user",
                 content=user_prompt,
-                attachments=attachments or [],
+                attachments=stored_attachment_names,
             )
             db.add(user_msg)
         await db.commit()
@@ -361,7 +480,10 @@ class AgentOrchestrator:
             system_instruction = _SYSTEM_PROMPT_TEMPLATE.format(**bundle)
 
             contents = _build_sanitized_contents(
-                history_messages, user_prompt, persist_user_message
+                history_messages,
+                user_prompt,
+                persist_user_message,
+                inline_attachments=merged_inline_attachments,
             )
 
             thinking_parts: list[str] = []

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import { NavigationShell } from "@/components/layout/NavigationShell";
 import { ChatComposer } from "@/components/chat/ChatComposer";
@@ -219,6 +219,57 @@ describe("Slim ChatComposer (Speech Input & Stop Control)", () => {
 
     delete (window as unknown as Record<string, unknown>).webkitSpeechRecognition;
   });
+
+  it("supports image paste, thumbnail preview, zoom modal, removal, and multimodal submit", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ filename: "pasted.png" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    render(<ChatComposer sending={false} onSend={onSend} />);
+
+    const textarea = screen.getByPlaceholderText("Gemuseにメッセージを入力...");
+    const pngFile = new File(["fake-png-bytes"], "pasted.png", { type: "image/png" });
+
+    fireEvent.paste(textarea, {
+      clipboardData: {
+        items: [
+          {
+            kind: "file",
+            type: "image/png",
+            getAsFile: () => pngFile,
+          },
+        ],
+        files: [pngFile],
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId("attachment-preview-strip")).toBeInTheDocument();
+    });
+
+    // Click thumbnail to open zoom modal
+    fireEvent.click(screen.getByRole("button", { name: "pasted.pngを拡大表示" }));
+    expect(screen.getByTestId("image-preview-modal")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "拡大プレビューを閉じる" }));
+    expect(screen.queryByTestId("image-preview-modal")).toBeNull();
+
+    // Submit without text -> sends attachment item with base64 & mime_type
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "送信" }));
+    });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    const [sentText, sentItems] = onSend.mock.calls[0];
+    expect(sentText).toBeTruthy();
+    expect(sentItems).toHaveLength(1);
+    expect(sentItems[0].mime_type).toBe("image/png");
+    expect(sentItems[0].data_base64.length).toBeGreaterThan(0);
+
+    fetchSpy.mockRestore();
+  });
 });
 
 describe("Welcome Screen & MessageBubble Interactions", () => {
@@ -297,6 +348,8 @@ describe("Welcome Screen & MessageBubble Interactions", () => {
       id: "u-1",
       role: "user",
       content: "元の質問です",
+      attachments: ["sample.png"],
+      attachment_previews: { "sample.png": "data:image/png;base64,iVBORw0KGgo=" },
       created_at: "2026-11-16T00:00:00Z",
     };
     rerender(
@@ -305,6 +358,11 @@ describe("Welcome Screen & MessageBubble Interactions", () => {
         isLastUserMessage={true}
         onEditResend={onEditResend}
       />
+    );
+    expect(screen.getByTestId("user-message-attachments")).toBeInTheDocument();
+    expect(screen.getByAltText("sample.png")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,iVBORw0KGgo="
     );
     fireEvent.click(screen.getByRole("button", { name: "メッセージを編集して再送信" }));
     fireEvent.change(screen.getByLabelText("メッセージを編集"), {

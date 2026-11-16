@@ -199,6 +199,17 @@ async def list_shared_uploads(request: Request) -> dict[str, Any]:
     return {"files": ctrl.list_uploads()}
 
 
+@router.get("/uploads/{filename}")
+async def fetch_shared_upload(filename: str, request: Request) -> FileResponse:
+    """Serve an uploaded file (e.g. attached image thumbnail) from /shared_files/uploads/."""
+    ctrl = _get_browser_controller(request)
+    try:
+        file_path = ctrl.get_upload_path(filename)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    return FileResponse(path=file_path, filename=file_path.name)
+
+
 @router.get("/downloads/{session_id}")
 async def list_session_downloads(session_id: str, request: Request) -> dict[str, Any]:
     ctrl = _get_browser_controller(request)

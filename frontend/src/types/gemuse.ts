@@ -76,6 +76,15 @@ export interface ApprovalCardData extends SSEApprovalRequiredData {
   error_message?: string;
 }
 
+export interface ChatAttachmentItem {
+  id: string;
+  filename: string;
+  mime_type: string;
+  data_base64: string;
+  preview_url: string;
+  uploaded_filename?: string;
+}
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
@@ -84,6 +93,7 @@ export interface ChatMessage {
   tool_calls?: SSEToolCallData[];
   citations?: string[];
   attachments?: string[];
+  attachment_previews?: Record<string, string>;
   approval?: ApprovalCardData;
   is_streaming?: boolean;
   created_at: string;

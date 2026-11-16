@@ -354,6 +354,13 @@ class BrowserController:
     def list_uploads(self) -> list[str]:
         return sorted(p.name for p in self.uploads_dir.iterdir() if p.is_file())
 
+    def get_upload_path(self, filename: str) -> Path:
+        uploads_root = self.uploads_dir.resolve()
+        target = (uploads_root / Path(filename).name).resolve()
+        if not str(target).startswith(str(uploads_root)) or not target.is_file():
+            raise FileNotFoundError(f"Upload file '{filename}' not found")
+        return target
+
     def save_upload(self, filename: str, content: bytes) -> Path:
         safe_name = Path(filename).name
         if not safe_name or safe_name in {".", ".."}:

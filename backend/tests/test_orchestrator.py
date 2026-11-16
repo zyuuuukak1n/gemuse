@@ -194,3 +194,118 @@ async def test_orchestrator_physically_blocks_irreversible_tool_for_approval(
     assert events[-1].data["action_type"] == "discord_send_message"
     assert "one_time_token" in events[-1].data
 
+
+async def test_orchestrator_multimodal_inline_image_and_chat_endpoint(
+    api_client,
+    auth_headers: dict[str, str],
+) -> None:
+    import base64
+    from types import SimpleNamespace
+    from httpx import AsyncClient
+    from app.agent.orchestrator import GoogleGenAIStreamProvider
+
+    assert isinstance(api_client, AsyncClient)
+    tiny_png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII="
+    )
+    tiny_b64 = base64.b64encode(tiny_png).decode("ascii")
+
+    # 1. End-to-end POST /api/chat with empty text + Base64 inline_attachments forwards inline image to LLM
+    app = api_client._transport.app  # type: ignore[attr-defined]
+    mock_llm = app.state.orchestrator.llm_provider
+    calls_before = len(mock_llm.calls)
+
+    resp = await api_client.post(
+        "/api/chat",
+        headers=auth_headers,
+        json={
+            "message": "",
+            "thinking_level": "low",
+            "mode": "sse",
+            "attachments": ["screenshot.png"],
+            "inline_attachments": [
+                {
+                    "filename": "screenshot.png",
+                    "mime_type": "image/png",
+                    "data_base64": tiny_b64,
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    assert len(mock_llm.calls) > calls_before
+    last_call = mock_llm.calls[-1]
+    assert "skip_if_exists=True" in last_call["system_instruction"]
+    last_user_turn = last_call["contents"][-1]
+    assert last_user_turn["role"] == "user"
+    assert len(last_user_turn["attachments"]) == 1
+    assert last_user_turn["attachments"][0]["mime_type"] == "image/png"
+    assert last_user_turn["attachments"][0]["data_base64"] == tiny_b64
+
+    # 2. Verify GoogleGenAIStreamProvider converts inline Base64 attachments via types.Part.from_bytes
+    captured_contents: list[object] = []
+
+    class _FakeTypes:
+        class GenerateContentConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class Content:
+            def __init__(self, role, parts):
+                self.role = role
+                self.parts = parts
+
+        class Part:
+            @staticmethod
+            def from_bytes(data: bytes, mime_type: str):
+                return ("bytes_part", mime_type, data)
+
+            @staticmethod
+            def from_text(text: str):
+                return ("text_part", text)
+
+    class _FakeModels:
+        async def generate_content_stream(self, *, model, contents, config):
+            captured_contents.extend(contents)
+
+            async def _gen():
+                yield SimpleNamespace(
+                    candidates=[
+                        SimpleNamespace(
+                            content=SimpleNamespace(
+                                parts=[SimpleNamespace(thought=False, function_call=None, text="OK")]
+                            )
+                        )
+                    ],
+                    usage_metadata=None,
+                )
+
+            return _gen()
+
+    provider = GoogleGenAIStreamProvider.__new__(GoogleGenAIStreamProvider)
+    provider._client = SimpleNamespace(aio=SimpleNamespace(models=_FakeModels()))
+    provider._types = _FakeTypes
+
+    out_chunks = [
+        chunk
+        async for chunk in provider.stream_generate(
+            model="gemini-4-hydrogen",
+            system_instruction="sys",
+            contents=[
+                {
+                    "role": "user",
+                    "content": "画像を解析してください",
+                    "attachments": [
+                        {"filename": "s.png", "mime_type": "image/png", "data_base64": tiny_b64}
+                    ],
+                }
+            ],
+            thinking_level="low",
+            tools=[],
+        )
+    ]
+    assert any(c.kind == "text" and c.text == "OK" for c in out_chunks)
+    assert len(captured_contents) == 1
+    assert ("bytes_part", "image/png", tiny_png) in captured_contents[0].parts
+    assert ("text_part", "画像を解析してください") in captured_contents[0].parts
+

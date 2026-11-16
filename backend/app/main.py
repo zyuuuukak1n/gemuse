@@ -142,6 +142,7 @@ def create_app(
             tool_registry=mcp_hub.tool_registry,
             approval_service=approval_service,
             mcp_hub=mcp_hub,
+            shared_files_dir=settings.SHARED_FILES_DIR,
         )
         gemini_bridge = GeminiBridgeService(
             memory_service=memory_service,
