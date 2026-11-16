@@ -298,7 +298,15 @@ servers:
         if path == "/api/v10/channels/8002":
             return httpx.Response(
                 200,
-                json={"id": "8002", "name": "🏢｜【総合】企業別", "type": 15},
+                json={
+                    "id": "8002",
+                    "name": "🏢｜【総合】企業別",
+                    "type": 15,
+                    "available_tags": [
+                        {"id": "tag-active", "name": "選考中", "emoji_name": "🎯"},
+                        {"id": "tag-int", "name": "二次面接予定", "emoji_name": None},
+                    ],
+                },
             )
         if path == "/api/v10/channels/8101":
             return httpx.Response(
@@ -310,7 +318,12 @@ servers:
                 200,
                 json={
                     "threads": [
-                        {"id": "th-1", "parent_id": "8002", "name": "アルファ株式会社"},
+                        {
+                            "id": "th-1",
+                            "parent_id": "8002",
+                            "name": "アルファ株式会社",
+                            "applied_tags": ["tag-active", "tag-int"],
+                        },
                         {"id": "th-other", "parent_id": "8003", "name": "別フォーラムの雑談"},
                     ]
                 },
@@ -320,10 +333,11 @@ servers:
                 200,
                 json={
                     "threads": [
-                        # Duplicate th-1 should be deduplicated; th-2 is archived
+                        # Duplicate th-1 should be deduplicated; th-2 is archived with no tags
                         {"id": "th-1", "parent_id": "8002", "name": "アルファ株式会社"},
-                        {"id": "th-2", "parent_id": "8002", "name": "ベータテック株式会社"},
-                    ]
+                        {"id": "th-2", "parent_id": "8002", "name": "ベータテック株式会社", "applied_tags": []},
+                    ],
+                    "has_more": False,
                 },
             )
         if path == "/api/v10/channels/8003/threads/archived/public":
@@ -398,17 +412,18 @@ servers:
     assert "type=text" in channels_out
     assert "🏢｜【総合】企業別" in channels_out
 
-    # 2a. Server name ("就活管理") resolves to numeric guild_id=7001 and expands forum type 15
+    # 2a. Server name ("就活管理") resolves to numeric guild_id=7001 and expands forum type 15 with tags
     forum_out = await connector.discord_read_history(guild_id="就活管理", channel_id="8002")
-    assert "[Thread: アルファ株式会社]" in forum_out
-    assert "[Thread: ベータテック株式会社]" in forum_out
+    assert "【全スレッド一覧サマリー】" in forum_out
+    assert "[Thread: アルファ株式会社 | Tags: 🎯 選考中, 二次面接予定]" in forum_out
+    assert "[Thread: ベータテック株式会社 | Tags: なし]" in forum_out
     assert "二次面接の日程調整メールを受信" in forum_out
     assert "書類選考通過、次回Webテスト案内" in forum_out
     assert "別フォーラムの雑談" not in forum_out
-    # Deduplicated: th-1 messages fetched once
+    # Deduplicated: th-1 messages fetched once with limit=10
     th1_fetches = [u for m, u, _ in recorded if m == "GET" and "/channels/th-1/messages" in u]
     assert len(th1_fetches) == 1
-    assert "limit=20" in th1_fetches[0]
+    assert "limit=10" in th1_fetches[0]
 
     # 2b. Server name resolved via /users/@me/guilds fallback when YAML name is empty
     semi_out = await connector.discord_read_history(guild_id="研究室ゼミ", channel_id="8101")
@@ -429,4 +444,170 @@ servers:
     search_text = await connector.discord_search_messages(query="webテスト")
     assert "ベータテック株式会社" in search_text
     assert "書類選考通過、次回Webテスト案内" in search_text
+
+
+async def test_discord_forum_archived_pagination_tags_and_defensive_truncation(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    perm_file = tmp_path / "discord_permissions_paginated.yaml"
+    perm_file.write_text(
+        """
+version: "1.0.0"
+default_policy: disabled
+servers:
+  - guild_id: "9001"
+    name: "就活管理"
+    permission: "read_only"
+    allowed_channels: []
+""",
+        encoding="utf-8",
+    )
+
+    archived_before_params: list[str | None] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v10/channels/9500":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "9500",
+                    "name": "企業別フォーラム",
+                    "type": 15,
+                    "available_tags": [
+                        {"id": "t-1", "name": "選考中", "emoji_name": "🔥"},
+                        {"id": "t-2", "name": "内定承諾検討", "emoji_name": ""},
+                    ],
+                },
+            )
+        if path == "/api/v10/guilds/9001/threads/active":
+            return httpx.Response(
+                200,
+                json={
+                    "threads": [
+                        {
+                            "id": "th-active",
+                            "parent_id": "9500",
+                            "name": "アクティブ企業A",
+                            "applied_tags": ["t-1"],
+                        }
+                    ]
+                },
+            )
+        if path == "/api/v10/channels/9500/threads/archived/public":
+            before = request.url.params.get("before")
+            archived_before_params.append(before)
+            if before is None:
+                return httpx.Response(
+                    200,
+                    json={
+                        "threads": [
+                            {
+                                "id": "th-arch-1",
+                                "parent_id": "9500",
+                                "name": "アーカイブ企業B",
+                                "applied_tags": ["t-2"],
+                                "thread_metadata": {"archive_timestamp": "2026-10-15T00:00:00Z"},
+                            }
+                        ],
+                        "has_more": True,
+                    },
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "threads": [
+                        {
+                            "id": "th-arch-2",
+                            "parent_id": "9500",
+                            "name": "アーカイブ企業C",
+                            "applied_tags": [],
+                            "thread_metadata": {"archive_timestamp": "2026-09-01T00:00:00Z"},
+                        }
+                    ],
+                    "has_more": False,
+                },
+            )
+        if path == "/api/v10/channels/th-active/messages":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "m-a-1",
+                        "content": "最新: 最終面接は11/20に確定",
+                        "timestamp": "2026-11-16T09:00:00Z",
+                        "author": {"username": "u"},
+                    },
+                    {
+                        "id": "m-a-2",
+                        "content": "古い: " + ("過去履歴" * 60),
+                        "timestamp": "2026-11-01T09:00:00Z",
+                        "author": {"username": "u"},
+                    },
+                ],
+            )
+        if path == "/api/v10/channels/th-arch-1/messages":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "m-b-1",
+                        "content": "最新: 内定通知書受領済み",
+                        "timestamp": "2026-10-14T12:00:00Z",
+                        "author": {"username": "u"},
+                    },
+                    {
+                        "id": "m-b-2",
+                        "content": "古い: " + ("面談メモ" * 60),
+                        "timestamp": "2026-10-01T12:00:00Z",
+                        "author": {"username": "u"},
+                    },
+                ],
+            )
+        if path == "/api/v10/channels/th-arch-2/messages":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "m-c-1",
+                        "content": "最新: ES提出済み",
+                        "timestamp": "2026-08-30T10:00:00Z",
+                        "author": {"username": "u"},
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    transport = httpx.MockTransport(_handler)
+    connector = DiscordMCPConnector(
+        bot_token="discord-test-bot-token",
+        permissions_path=perm_file,
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(
+            base_url="https://discord.com/api/v10",
+            transport=transport,
+        ),
+        max_forum_output_chars=1200,
+    )
+
+    out = await connector.discord_read_history(guild_id="就活管理", channel_id="9500")
+
+    # Archived pagination queried page 1 (before=None) then page 2 (before=2026-10-15T00:00:00Z)
+    assert archived_before_params == [None, "2026-10-15T00:00:00Z"]
+
+    # Summary + all 3 threads + emoji / plain / none tags preserved
+    assert "合計 3 スレッド" in out
+    assert "【全スレッド一覧サマリー】" in out
+    assert "[Thread: アクティブ企業A | Tags: 🔥 選考中]" in out
+    assert "[Thread: アーカイブ企業B | Tags: 内定承諾検討]" in out
+    assert "[Thread: アーカイブ企業C | Tags: なし]" in out
+
+    # Latest 1 message per thread preserved even after defensive truncation of older messages
+    assert "最新: 最終面接は11/20に確定" in out
+    assert "最新: 内定通知書受領済み" in out
+    assert "最新: ES提出済み" in out
+    assert "古いメッセージ 1 件を省略" in out
 

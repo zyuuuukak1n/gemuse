@@ -29,6 +29,9 @@ CHANNEL_TYPE_LABELS: dict[int, str] = {
 READABLE_CHANNEL_TYPES = tuple(CHANNEL_TYPE_LABELS.keys())
 FORUM_CHANNEL_TYPES = (15, 16)
 MAX_THREAD_FETCH_CONCURRENCY = 5
+MAX_ARCHIVED_THREAD_PAGES = 50
+FORUM_THREAD_MESSAGE_LIMIT = 10
+DEFAULT_FORUM_MAX_CHARS = 24000
 
 
 class GuildPermission(BaseModel):
@@ -104,6 +107,34 @@ def _extract_searchable_text(msg: dict[str, Any]) -> str:
     return "\n".join(parts)
 
 
+def _build_forum_tag_map(channel_data: dict[str, Any] | None) -> dict[str, str]:
+    """Map forum tag_id -> formatted tag display name ('<emoji> <name>' or '<name>')."""
+    if not isinstance(channel_data, dict):
+        return {}
+    tag_map: dict[str, str] = {}
+    for raw_tag in channel_data.get("available_tags") or []:
+        if not isinstance(raw_tag, dict):
+            continue
+        tag_id = str(raw_tag.get("id", "")).strip()
+        name = str(raw_tag.get("name", "")).strip()
+        emoji_name = str(raw_tag.get("emoji_name") or "").strip()
+        if not tag_id or not name:
+            continue
+        tag_map[tag_id] = f"{emoji_name} {name}".strip() if emoji_name else name
+    return tag_map
+
+
+def _format_thread_tags(thread: dict[str, Any], tag_map: dict[str, str]) -> str:
+    """Resolve thread applied_tags IDs via tag_map into a comma-separated string."""
+    raw_ids = thread.get("applied_tags") or []
+    resolved: list[str] = []
+    for raw_id in raw_ids:
+        tid = str(raw_id).strip()
+        if tid in tag_map:
+            resolved.append(tag_map[tid])
+    return ", ".join(resolved) if resolved else "なし"
+
+
 class DiscordMCPConnector(BaseMCPConnector):
     """
     Discord REST API v10 connector managing multiple servers via a single Bot token.
@@ -123,6 +154,7 @@ class DiscordMCPConnector(BaseMCPConnector):
         session_factory: async_sessionmaker[AsyncSession] | None = None,
         api_base_url: str = "https://discord.com/api/v10",
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        max_forum_output_chars: int = DEFAULT_FORUM_MAX_CHARS,
     ) -> None:
         self._bot_token = bot_token.strip()
         self._permissions_path = Path(permissions_path)
@@ -130,6 +162,7 @@ class DiscordMCPConnector(BaseMCPConnector):
         self._session_factory = session_factory
         self._api_base_url = api_base_url.rstrip("/")
         self._http_client_factory = http_client_factory
+        self._max_forum_output_chars = max(500, int(max_forum_output_chars))
         self._permissions = load_discord_permissions(self._permissions_path)
 
     def is_configured(self) -> bool:
@@ -257,35 +290,155 @@ class DiscordMCPConnector(BaseMCPConnector):
         guild_id: str,
         forum_channel_id: str,
     ) -> list[dict[str, Any]]:
-        """Gather active and public archived threads belonging to a forum/media channel."""
+        """Gather active threads and paginate through all public archived forum threads."""
         target_parent = str(forum_channel_id)
-        active_task = client.get(f"/guilds/{guild_id}/threads/active")
-        archived_task = client.get(f"/channels/{target_parent}/threads/archived/public")
-        active_resp, archived_resp = await asyncio.gather(
-            active_task, archived_task, return_exceptions=True
-        )
-
         threads_by_id: dict[str, dict[str, Any]] = {}
+
+        async def _collect_archived_paginated() -> None:
+            before: str | None = None
+            seen_cursors: set[str] = set()
+            for _ in range(MAX_ARCHIVED_THREAD_PAGES):
+                params: dict[str, Any] = {"limit": 100}
+                if before:
+                    params["before"] = before
+                resp = await client.get(
+                    f"/channels/{target_parent}/threads/archived/public",
+                    params=params,
+                )
+                if resp.status_code != 200:
+                    break
+                payload = resp.json()
+                raw_archived = (
+                    payload.get("threads", [])
+                    if isinstance(payload, dict)
+                    else (payload or [])
+                )
+                for th in raw_archived:
+                    if isinstance(th, dict):
+                        tid = str(th.get("id", ""))
+                        if tid and tid not in threads_by_id:
+                            threads_by_id[tid] = {**th, "_thread_state": "archived"}
+
+                has_more = bool(payload.get("has_more")) if isinstance(payload, dict) else False
+                if not has_more or not raw_archived:
+                    break
+
+                last_item = raw_archived[-1] if isinstance(raw_archived[-1], dict) else {}
+                last_meta = last_item.get("thread_metadata") or {}
+                next_before = (
+                    last_meta.get("archive_timestamp")
+                    if isinstance(last_meta, dict)
+                    else None
+                )
+                if not next_before or str(next_before) in seen_cursors:
+                    break
+                seen_cursors.add(str(next_before))
+                before = str(next_before)
+
+        active_resp, archived_err = await asyncio.gather(
+            client.get(f"/guilds/{guild_id}/threads/active"),
+            _collect_archived_paginated(),
+            return_exceptions=True,
+        )
+        if isinstance(archived_err, Exception):
+            logger.warning(
+                "Failed to paginate archived forum threads",
+                extra={"channel_id": target_parent, "error": mask_secrets(str(archived_err))},
+            )
 
         if isinstance(active_resp, httpx.Response) and active_resp.status_code == 200:
             payload = active_resp.json()
             raw_active = payload.get("threads", []) if isinstance(payload, dict) else payload
+            active_entries: dict[str, dict[str, Any]] = {}
             for th in raw_active or []:
                 if isinstance(th, dict) and str(th.get("parent_id", "")) == target_parent:
                     tid = str(th.get("id", ""))
-                    if tid and tid not in threads_by_id:
-                        threads_by_id[tid] = {**th, "_thread_state": "active"}
-
-        if isinstance(archived_resp, httpx.Response) and archived_resp.status_code == 200:
-            payload = archived_resp.json()
-            raw_archived = payload.get("threads", []) if isinstance(payload, dict) else payload
-            for th in raw_archived or []:
-                if isinstance(th, dict):
-                    tid = str(th.get("id", ""))
-                    if tid and tid not in threads_by_id:
-                        threads_by_id[tid] = {**th, "_thread_state": "archived"}
+                    if tid and tid not in active_entries:
+                        active_entries[tid] = {**th, "_thread_state": "active"}
+            # Keep active threads ordered before archived threads without duplicates
+            merged: dict[str, dict[str, Any]] = dict(active_entries)
+            for tid, th in threads_by_id.items():
+                if tid not in merged:
+                    merged[tid] = th
+            return list(merged.values())
 
         return list(threads_by_id.values())
+
+    def _render_forum_blocks_with_truncation(
+        self,
+        summary_block: str,
+        thread_entries: list[dict[str, Any]],
+    ) -> str:
+        """
+        Render forum summary + thread blocks within `_max_forum_output_chars`.
+
+        Guarantees all thread titles, tags, and at least the latest message per thread
+        are preserved whenever possible before trimming older messages.
+        """
+        full_blocks = [summary_block]
+        for entry in thread_entries:
+            lines = [entry["header"]]
+            if entry["msg_lines"]:
+                lines.extend(entry["msg_lines"])
+            else:
+                lines.append(entry["empty_line"])
+            full_blocks.append("\n".join(lines))
+
+        full_text = "\n\n".join(full_blocks)
+        if len(full_text) <= self._max_forum_output_chars:
+            return full_text
+
+        # First keep header + latest 1 message for every thread
+        extra_counts = [max(0, len(entry["msg_lines"]) - 1) for entry in thread_entries]
+        kept_counts = [min(1, len(entry["msg_lines"])) for entry in thread_entries]
+
+        def _assemble(counts: list[int]) -> str:
+            parts = [summary_block]
+            for entry, keep_n in zip(thread_entries, counts):
+                lines = [entry["header"]]
+                if entry["msg_lines"]:
+                    lines.extend(entry["msg_lines"][:keep_n])
+                    omitted = len(entry["msg_lines"]) - keep_n
+                    if omitted > 0:
+                        lines.append(f"  ... (古いメッセージ {omitted} 件を省略)")
+                else:
+                    lines.append(entry["empty_line"])
+                parts.append("\n".join(lines))
+            return "\n\n".join(parts)
+
+        base_text = _assemble(kept_counts)
+        if len(base_text) >= self._max_forum_output_chars:
+            # Even 1 message per thread exceeds cap: preserve summary + all headers + trimmed latest previews
+            minimal_parts = [summary_block]
+            for entry in thread_entries:
+                if entry["msg_lines"]:
+                    latest_preview = entry["msg_lines"][0]
+                    if len(latest_preview) > 140:
+                        latest_preview = f"{latest_preview[:137]}..."
+                    omitted = len(entry["msg_lines"]) - 1
+                    block_lines = [entry["header"], latest_preview]
+                    if omitted > 0:
+                        block_lines.append(f"  ... (古いメッセージ {omitted} 件を省略)")
+                    minimal_parts.append("\n".join(block_lines))
+                else:
+                    minimal_parts.append(f"{entry['header']}\n{entry['empty_line']}")
+            return "\n\n".join(minimal_parts)
+
+        # Greedily add older messages within remaining character budget
+        current_text = base_text
+        for idx, entry in enumerate(thread_entries):
+            if extra_counts[idx] <= 0:
+                continue
+            for next_count in range(2, len(entry["msg_lines"]) + 1):
+                candidate_counts = list(kept_counts)
+                candidate_counts[idx] = next_count
+                candidate_text = _assemble(candidate_counts)
+                if len(candidate_text) <= self._max_forum_output_chars:
+                    kept_counts[idx] = next_count
+                    current_text = candidate_text
+                else:
+                    break
+        return current_text
 
     async def _read_forum_history(
         self,
@@ -293,9 +446,11 @@ class DiscordMCPConnector(BaseMCPConnector):
         policy: GuildPermission,
         channel_id: str,
         channel_name: str,
+        channel_data: dict[str, Any] | None = None,
     ) -> str:
-        """Expand all active and archived threads in a forum/media channel and read recent messages."""
+        """Expand all active/archived threads in a forum/media channel with resolved tags."""
         guild_label = policy.name or policy.guild_id
+        tag_map = _build_forum_tag_map(channel_data)
         threads = await self._collect_forum_threads(client, policy.guild_id, channel_id)
         if not threads:
             return wrap_untrusted_data(
@@ -305,49 +460,73 @@ class DiscordMCPConnector(BaseMCPConnector):
 
         sem = asyncio.Semaphore(MAX_THREAD_FETCH_CONCURRENCY)
 
-        async def _fetch_thread_block(th: dict[str, Any]) -> str:
+        async def _fetch_thread_messages(th: dict[str, Any]) -> tuple[list[str], str]:
             tid = str(th.get("id", ""))
-            title = str(th.get("name", tid))
-            state = str(th.get("_thread_state", "active"))
             async with sem:
                 resp = await client.get(
                     f"/channels/{tid}/messages",
-                    params={"limit": 20},
+                    params={"limit": FORUM_THREAD_MESSAGE_LIMIT},
                 )
             if resp.status_code != 200:
-                return f"[Thread: {title}] (thread_id={tid}, status={state}) メッセージ取得失敗 (HTTP {resp.status_code})"
+                return [], f"  メッセージ取得失敗 (HTTP {resp.status_code})"
 
             msgs = resp.json() or []
             if not msgs:
-                return f"[Thread: {title}] (thread_id={tid}, status={state}) メッセージはありません。"
+                return [], "  メッセージはありません。"
 
-            lines = [f"[Thread: {title}] (thread_id={tid}, status={state}, guild_id={policy.guild_id})"]
+            msg_lines: list[str] = []
             for m in msgs:
                 author = (m.get("author") or {}).get("username", "unknown")
                 ts = m.get("timestamp", "")
                 text = _extract_searchable_text(m)
-                lines.append(f"  ({ts}) @{author} [msg_id={m.get('id')}]: {text}")
-            return "\n".join(lines)
+                msg_lines.append(f"  ({ts}) @{author} [msg_id={m.get('id')}]: {text}")
+            return msg_lines, ""
 
-        blocks = await asyncio.gather(
-            *(_fetch_thread_block(th) for th in threads),
+        fetched = await asyncio.gather(
+            *(_fetch_thread_messages(th) for th in threads),
             return_exceptions=True,
         )
-        rendered_blocks: list[str] = [
-            f"[Discord: {guild_label} / #{channel_name} (Forum, guild_id={policy.guild_id})] 合計 {len(threads)} スレッド"
+
+        summary_lines = [
+            f"[Discord: {guild_label} / #{channel_name} (Forum, guild_id={policy.guild_id})] 合計 {len(threads)} スレッド",
+            "【全スレッド一覧サマリー】",
         ]
-        for th, block in zip(threads, blocks):
-            if isinstance(block, Exception):
-                rendered_blocks.append(
-                    f"[Thread: {th.get('name', th.get('id'))}] 取得エラー: {mask_secrets(str(block))}"
+        thread_entries: list[dict[str, Any]] = []
+
+        for th, res in zip(threads, fetched):
+            tid = str(th.get("id", ""))
+            title = str(th.get("name", tid))
+            state = str(th.get("_thread_state", "active"))
+            tags_str = _format_thread_tags(th, tag_map)
+            summary_lines.append(f"- {title} | Tags: {tags_str} (status={state}, thread_id={tid})")
+
+            header = (
+                f"[Thread: {title} | Tags: {tags_str}] "
+                f"(thread_id={tid}, status={state}, guild_id={policy.guild_id})"
+            )
+            if isinstance(res, Exception):
+                thread_entries.append(
+                    {
+                        "header": header,
+                        "msg_lines": [],
+                        "empty_line": f"  取得エラー: {mask_secrets(str(res))}",
+                    }
                 )
             else:
-                rendered_blocks.append(block)
+                msg_lines, empty_line = res
+                thread_entries.append(
+                    {
+                        "header": header,
+                        "msg_lines": msg_lines,
+                        "empty_line": empty_line,
+                    }
+                )
 
-        return wrap_untrusted_data(
-            f"discord:{guild_label}/#{channel_name}",
-            "\n\n".join(rendered_blocks),
+        rendered_body = self._render_forum_blocks_with_truncation(
+            "\n".join(summary_lines),
+            thread_entries,
         )
+        return wrap_untrusted_data(f"discord:{guild_label}/#{channel_name}", rendered_body)
 
     async def discord_list_channels(self, guild_id: str | None = None) -> str:
         """List accessible channels across permitted Discord guilds."""
@@ -415,6 +594,7 @@ class DiscordMCPConnector(BaseMCPConnector):
             ch_resp = await client.get(f"/channels/{channel_id}")
             channel_name = channel_id
             channel_type = 0
+            ch_data: dict[str, Any] | None = None
             if ch_resp.status_code == 200:
                 ch_data = ch_resp.json()
                 channel_name = ch_data.get("name", channel_id)
@@ -422,7 +602,11 @@ class DiscordMCPConnector(BaseMCPConnector):
 
             if channel_type in FORUM_CHANNEL_TYPES:
                 return await self._read_forum_history(
-                    client, policy, str(channel_id), str(channel_name)
+                    client,
+                    policy,
+                    str(channel_id),
+                    str(channel_name),
+                    channel_data=ch_data,
                 )
 
             msg_resp = await client.get(
@@ -529,11 +713,13 @@ class DiscordMCPConnector(BaseMCPConnector):
                         if not isinstance(th_list, list):
                             continue
                         fc_name = str(fc.get("name", fc.get("id", "")))
+                        fc_tag_map = _build_forum_tag_map(fc)
                         for th in th_list:
                             tid = str(th.get("id", ""))
                             tname = str(th.get("name", tid))
+                            tag_suffix = f" | Tags: {_format_thread_tags(th, fc_tag_map)}" if fc_tag_map else ""
                             scan_targets.append(
-                                (tid, f"[Discord: {guild_label} / #{fc_name} > Thread: {tname}]")
+                                (tid, f"[Discord: {guild_label} / #{fc_name} > Thread: {tname}{tag_suffix}]")
                             )
 
                 target_results = await asyncio.gather(
