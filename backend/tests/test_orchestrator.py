@@ -309,3 +309,117 @@ async def test_orchestrator_multimodal_inline_image_and_chat_endpoint(
     assert ("bytes_part", "image/png", tiny_png) in captured_contents[0].parts
     assert ("text_part", "画像を解析してください") in captured_contents[0].parts
 
+
+async def test_orchestrator_round_limit_forces_final_report_without_tools(
+    db_session: AsyncSession,
+    memory_service: MemoryService,
+) -> None:
+    from app.agent.orchestrator import LLMStreamProvider
+
+    approval_service = ApprovalService(TEST_HMAC_SECRET)
+    registry = ToolRegistry(approval_service)
+
+    class _DummySheetStub(MCPServerClient):
+        def __init__(self) -> None:
+            super().__init__("dummy")
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def list_tools(self) -> list[MCPToolDefinition]:
+            return [
+                MCPToolDefinition(
+                    name="dummy_step",
+                    description="Dummy multi-step tool",
+                    requires_approval=False,
+                    source_type="mcp",
+                )
+            ]
+
+        async def call_tool(self, tool_name: str, arguments: dict) -> str:
+            return f"ok:{arguments.get('idx')}"
+
+    stub = _DummySheetStub()
+    registry.register_server(stub, await stub.list_tools())
+
+    class _LoopingProvider(LLMStreamProvider):
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        async def stream_generate(
+            self,
+            *,
+            model: str,
+            system_instruction: str,
+            contents: list[dict],
+            thinking_level,
+            tools,
+        ):
+            self.calls.append({"contents": contents, "tools": tools})
+            if tools is None:
+                yield StreamChunk(
+                    kind="text",
+                    text="### 完了した処理と残作業\n- `dummy_step` 2件を完了しました。\n- 残りの登録を続けて実行できます。",
+                )
+                return
+            yield StreamChunk(
+                kind="tool_call",
+                tool_name="dummy_step",
+                tool_args={"idx": len(self.calls)},
+            )
+
+    provider = _LoopingProvider()
+    default_orch = AgentOrchestrator(
+        model_name="gemini-4-hydrogen",
+        llm_provider=provider,
+        memory_service=memory_service,
+        tool_registry=registry,
+        approval_service=approval_service,
+    )
+    assert default_orch.max_tool_rounds >= 20
+
+    limited_orch = AgentOrchestrator(
+        model_name="gemini-4-hydrogen",
+        llm_provider=provider,
+        memory_service=memory_service,
+        tool_registry=registry,
+        approval_service=approval_service,
+        max_tool_rounds=2,
+    )
+
+    conv = Conversation(id=uuid.uuid4(), title="Multi-step Limit Test")
+    db_session.add(conv)
+    await db_session.flush()
+    await db_session.refresh(conv, attribute_names=["messages"])
+    job = Job(
+        id=uuid.uuid4(),
+        conversation_id=conv.id,
+        status="queued",
+        prompt="複数社を一括登録して",
+        thinking_level="high",
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    events = [
+        ev
+        async for ev in limited_orch.stream_chat(
+            db_session,
+            conversation=conv,
+            job=job,
+            user_prompt="複数社を一括登録して",
+        )
+    ]
+
+    # 2 tool rounds + 1 final forced synthesis call with tools=None
+    assert len(provider.calls) == 3
+    assert provider.calls[0]["tools"]
+    assert provider.calls[1]["tools"]
+    assert provider.calls[2]["tools"] is None
+    assert "上限（2回）" in provider.calls[2]["contents"][-1]["content"]
+    assert events[-1].event == "done"
+    assert "完了した処理と残作業" in events[-1].data["answer"]
+

@@ -51,7 +51,7 @@ class MockGeminiStreamProvider(LLMStreamProvider):
         system_instruction: str,
         contents: list[dict[str, Any]],
         thinking_level: ThinkingLevel,
-        tools: list[MCPToolDefinition],
+        tools: list[MCPToolDefinition] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         self.calls.append(
             {

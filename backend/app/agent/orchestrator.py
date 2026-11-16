@@ -53,7 +53,7 @@ _SYSTEM_PROMPT_TEMPLATE = """You are Gemuse, a secure, self-hosted personal AI a
 - Google ドキュメント・スプレッドシート・スライド・Drive ファイルを作成・編集・検索した際は、生のファイルIDだけを羅列せず、**必ず `[ファイルタイトル](公式URL)` 形式の Markdown リンク**を出力すること。
 - 作成・取得したドキュメントの本文抜粋や、スプレッドシートの内容（Markdown テーブル形式）をプレビューとして本文中に見やすく提示すること。
 - Google スプレッドシートに表を作成・更新した際は、`sheets_format_table` を呼び出してネイティブテーブル化・ヘッダー装飾・罫線・列幅自動調整を適用し、見やすく仕上げること（ステータス列などの条件付き色分けが必要な場合は `sheets_apply_formatting` も併用すること）。
-- Discord フォーラムへ企業スレッドを作成する際は、必ず事前に `discord_read_history` 等で既存スレッドの体裁・記載項目・タグ体系を読み取って踏襲し、`discord_create_forum_thread` の `skip_if_exists=True` で重複作成を防ぐこと。
+- Discord フォーラムへ企業スレッドを作成する際は、必ず事前に `discord_read_history` 等で既存スレッドの体裁・記載項目・タグ体系を読み取って踏襲し、複数社をまとめて登録する場合は `discord_bulk_create_forum_threads`（1社のみは `discord_create_forum_thread`）を `skip_if_exists=True` で呼び出して重複作成を防ぐこと。
 - After receiving external tool results, ALWAYS produce a complete final user-facing answer in Japanese. Never end a turn with empty text.
 
 ## Layer 1: Core Memory
@@ -220,7 +220,7 @@ class LLMStreamProvider(ABC):
         system_instruction: str,
         contents: list[dict[str, Any]],
         thinking_level: ThinkingLevel,
-        tools: list[MCPToolDefinition],
+        tools: list[MCPToolDefinition] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         """Yield StreamChunk items asynchronously."""
         yield StreamChunk(kind="text", text="")  # pragma: no cover
@@ -243,7 +243,7 @@ class GoogleGenAIStreamProvider(LLMStreamProvider):
         system_instruction: str,
         contents: list[dict[str, Any]],
         thinking_level: ThinkingLevel,
-        tools: list[MCPToolDefinition],
+        tools: list[MCPToolDefinition] | None = None,
     ) -> AsyncIterator[StreamChunk]:
         types = self._types
         config_kwargs: dict[str, Any] = {
@@ -360,7 +360,7 @@ class AgentOrchestrator:
         tool_registry: ToolRegistry,
         approval_service: ApprovalService,
         mcp_hub: MCPHubManager | None = None,
-        max_tool_rounds: int = 5,
+        max_tool_rounds: int = 24,
         shared_files_dir: str | None = None,
     ) -> None:
         self.model_name = model_name
@@ -488,10 +488,12 @@ class AgentOrchestrator:
 
             thinking_parts: list[str] = []
             answer_parts: list[str] = []
+            executed_tools_log: list[dict[str, str]] = []
+            hit_round_limit = False
             input_tokens = 0
             output_tokens = 0
 
-            for _round in range(self.max_tool_rounds):
+            for round_idx in range(self.max_tool_rounds):
                 pending_calls: list[ToolCallRequest] = []
                 round_text_parts: list[str] = []
 
@@ -611,6 +613,7 @@ class AgentOrchestrator:
                         return
 
                     if res.success:
+                        executed_tools_log.append({"tool": res.tool_name, "status": "completed"})
                         yield SSEEvent(
                             event="tool_call",
                             data={
@@ -623,6 +626,7 @@ class AgentOrchestrator:
                             f"Tool `{res.tool_name}` result:\n{res.output}"
                         )
                     else:
+                        executed_tools_log.append({"tool": res.tool_name, "status": "error"})
                         yield SSEEvent(
                             event="tool_call",
                             data={
@@ -643,29 +647,44 @@ class AgentOrchestrator:
                         "content": "External tool results:\n\n" + "\n\n".join(tool_context_blocks),
                     }
                 )
+                if round_idx == self.max_tool_rounds - 1:
+                    hit_round_limit = True
 
-            # Fallback synthesis pass if model returned only thoughts/tool calls with empty text
+            # Guarantee final synthesis call (with tools=None) when loop hit round limit or returned empty text
             full_answer = "".join(answer_parts).strip()
-            if not full_answer:
+            if hit_round_limit or not full_answer:
                 fallback_contents = list(contents)
-                synthesis_prompt = (
-                    "上記のツール実行結果・コンテキストをもとに、ユーザーへの最終回答を"
-                    "見出し・箇条書き・太字を使って見やすい日本語Markdownで作成してください。"
-                )
+                if hit_round_limit:
+                    completed_summary = ", ".join(
+                        f"{entry['tool']}({entry['status']})" for entry in executed_tools_log
+                    )
+                    synthesis_prompt = (
+                        f"ツール呼び出し回数が上限（{self.max_tool_rounds}回）に達したため、ここで一旦処理を区切ります。\n"
+                        f"実行済みツール履歴: {completed_summary or 'なし'}\n"
+                        "上記のツール実行結果とコンテキストをもとに、(1) これまでに完了した処理内容 と "
+                        "(2) まだ残っている作業・次のステップ を、見出し・箇条書きを使った分かりやすい日本語Markdownでユーザーへ報告してください。"
+                    )
+                else:
+                    synthesis_prompt = (
+                        "上記のツール実行結果・コンテキストをもとに、ユーザーへの最終回答を"
+                        "見出し・箇条書き・太字を使って見やすい日本語Markdownで作成してください。"
+                    )
+
                 if fallback_contents and fallback_contents[-1]["role"] == "user":
                     fallback_contents[-1] = {
-                        "role": "user",
+                        **fallback_contents[-1],
                         "content": f"{fallback_contents[-1]['content']}\n\n{synthesis_prompt}",
                     }
                 else:
                     fallback_contents.append({"role": "user", "content": synthesis_prompt})
 
+                final_round_parts: list[str] = []
                 async for chunk in self.llm_provider.stream_generate(
                     model=self.model_name,
                     system_instruction=system_instruction,
                     contents=fallback_contents,
                     thinking_level="low",
-                    tools=[],
+                    tools=None,
                 ):
                     if chunk.kind == "thinking" and chunk.text:
                         thinking_parts.append(chunk.text)
@@ -674,15 +693,31 @@ class AgentOrchestrator:
                             data={"stage": "reasoning", "summary": chunk.text},
                         )
                     elif chunk.kind == "text" and chunk.text:
+                        final_round_parts.append(chunk.text)
                         answer_parts.append(chunk.text)
                         yield SSEEvent(event="delta", data={"text": chunk.text})
                     elif chunk.kind == "usage":
                         input_tokens = max(input_tokens, chunk.input_tokens)
                         output_tokens = max(output_tokens, chunk.output_tokens)
 
+                if hit_round_limit and full_answer and final_round_parts:
+                    # Keep clean separation between any earlier narration and the final summary
+                    answer_parts.insert(len(answer_parts) - len(final_round_parts), "\n\n")
+
             full_answer = "".join(answer_parts).strip()
             if not full_answer:
-                full_answer = "ツールを実行しましたが、応答テキストを生成できませんでした。もう一度お試しください。"
+                if executed_tools_log:
+                    summary_lines = "\n".join(
+                        f"- `{e['tool']}`: {e['status']}" for e in executed_tools_log
+                    )
+                    full_answer = (
+                        "### 処理実行サマリー\n\n"
+                        "以下のツールを実行しました:\n"
+                        f"{summary_lines}\n\n"
+                        "続けて詳細な集計や追加作業が必要な場合はお知らせください。"
+                    )
+                else:
+                    full_answer = "応答テキストを生成できませんでした。もう一度お試しください。"
                 yield SSEEvent(event="delta", data={"text": full_answer})
 
             thinking_summary = "\n".join(thinking_parts).strip() or None

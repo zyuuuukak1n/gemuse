@@ -846,3 +846,126 @@ servers:
     assert '"channel_id": "ch-new-forum"' in ch_out
     assert '"type": 15' in ch_out
 
+
+async def test_discord_bulk_create_forum_threads_and_429_retry(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio as std_asyncio
+
+    perm_file = tmp_path / "discord_permissions_bulk.yaml"
+    perm_file.write_text(
+        """
+version: "1.0.0"
+default_policy: disabled
+servers:
+  - guild_id: "5100"
+    name: "就活管理"
+    permission: "read_write"
+    allowed_channels: []
+""",
+        encoding="utf-8",
+    )
+
+    sleep_calls: list[float] = []
+    real_sleep = std_asyncio.sleep
+
+    async def _fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        await real_sleep(0)
+
+    monkeypatch.setattr("app.mcp_hub.servers.discord_mcp.asyncio.sleep", _fake_sleep)
+
+    thread_list_fetch_count = {"active": 0, "archived": 0}
+    post_attempts = {"count": 0}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/v10/channels/6100":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "6100",
+                    "name": "企業別フォーラム",
+                    "type": 15,
+                    "available_tags": [
+                        {"id": "tag-active", "name": "選考中", "emoji_name": "🎯"},
+                        {"id": "tag-es", "name": "ES提出", "emoji_name": ""},
+                    ],
+                },
+            )
+        if path == "/api/v10/guilds/5100/threads/active":
+            thread_list_fetch_count["active"] += 1
+            return httpx.Response(
+                200,
+                json={
+                    "threads": [
+                        {"id": "th-existing", "parent_id": "6100", "name": "アルファ株式会社", "applied_tags": ["tag-active"]}
+                    ]
+                },
+            )
+        if path == "/api/v10/channels/6100/threads/archived/public":
+            thread_list_fetch_count["archived"] += 1
+            return httpx.Response(200, json={"threads": [], "has_more": False})
+        if path == "/api/v10/channels/6100/threads" and request.method == "POST":
+            post_attempts["count"] += 1
+            # Trigger 429 rate limit on the very first POST, then succeed on retry
+            if post_attempts["count"] == 1:
+                return httpx.Response(
+                    429,
+                    json={"message": "You are being rate limited.", "retry_after": 0.25},
+                )
+            body = json.loads(request.content.decode("utf-8"))
+            return httpx.Response(
+                200,
+                json={
+                    "id": f"th-new-{post_attempts['count']}",
+                    "name": body["name"],
+                    "applied_tags": body["applied_tags"],
+                },
+            )
+        return httpx.Response(404)
+
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    transport = httpx.MockTransport(_handler)
+    connector = DiscordMCPConnector(
+        bot_token="discord-test-bot-token",
+        permissions_path=perm_file,
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(
+            base_url="https://discord.com/api/v10",
+            transport=transport,
+        ),
+    )
+
+    tools_map = {t.name: t for t in connector.get_tools()}
+    assert tools_map["discord_create_forum_thread"].requires_approval is False
+    assert tools_map["discord_update_thread"].requires_approval is False
+    assert tools_map["discord_bulk_create_forum_threads"].requires_approval is False
+    assert tools_map["discord_delete_message"].requires_approval is True
+
+    out = await connector.discord_bulk_create_forum_threads(
+        guild_id="就活管理",
+        channel_id="6100",
+        threads=[
+            {"title": "アルファ株式会社", "content": "既存なのでスキップ", "tags": ["選考中"]},
+            {"title": "ベータ株式会社", "content": "新規登録1社目", "tags": ["選考中", "ES提出"]},
+            {"title": "ガンマ株式会社", "content": "新規登録2社目", "tags": ["ES提出"]},
+        ],
+        skip_if_exists=True,
+    )
+
+    assert '"created_count": 2' in out
+    assert '"skipped_count": 1' in out
+    assert '"failed_count": 0' in out
+    assert "ベータ株式会社" in out
+    assert "ガンマ株式会社" in out
+    # Upfront thread check called exactly once
+    assert thread_list_fetch_count == {"active": 1, "archived": 1}
+    # 429 retry_after (0.25s) and inter-thread 0.6s pacing were both invoked
+    assert 0.25 in sleep_calls
+    assert 0.6 in sleep_calls
+    assert post_attempts["count"] == 3
+

@@ -34,6 +34,8 @@ MAX_THREAD_FETCH_CONCURRENCY = 5
 MAX_ARCHIVED_THREAD_PAGES = 50
 FORUM_THREAD_MESSAGE_LIMIT = 10
 DEFAULT_FORUM_MAX_CHARS = 24000
+MAX_RATE_LIMIT_RETRIES = 3
+BULK_THREAD_CREATE_INTERVAL_SECONDS = 0.6
 
 
 class GuildPermission(BaseModel):
@@ -232,6 +234,67 @@ def _titles_match_similar(target_title: str, existing_title: str) -> bool:
     return len(shorter) >= 3 and shorter in longer
 
 
+class _RateLimitRetryClient:
+    """AsyncClient wrapper retrying HTTP 429 Too Many Requests using Discord `retry_after`."""
+
+    def __init__(
+        self,
+        inner: httpx.AsyncClient,
+        *,
+        max_retries: int = MAX_RATE_LIMIT_RETRIES,
+    ) -> None:
+        self._inner = inner
+        self._max_retries = max_retries
+
+    async def __aenter__(self) -> "_RateLimitRetryClient":
+        await self._inner.__aenter__()
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self._inner.__aexit__(*args)
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        resp = await self._inner.request(method, url, **kwargs)
+        for attempt in range(self._max_retries):
+            if resp.status_code != 429:
+                return resp
+            delay = 1.0
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and body.get("retry_after") is not None:
+                    delay = float(body["retry_after"])
+            except Exception:
+                header_val = resp.headers.get("Retry-After")
+                if header_val:
+                    try:
+                        delay = float(header_val)
+                    except ValueError:
+                        pass
+            delay = max(0.0, min(30.0, delay))
+            logger.warning(
+                "Discord API rate limited (429); sleeping before retry",
+                extra={"url": url, "retry_after": delay, "attempt": attempt + 1},
+            )
+            await asyncio.sleep(delay)
+            resp = await self._inner.request(method, url, **kwargs)
+        return resp
+
+    async def get(self, url: str, **kwargs: Any) -> httpx.Response:
+        return await self.request("GET", url, **kwargs)
+
+    async def post(self, url: str, **kwargs: Any) -> httpx.Response:
+        return await self.request("POST", url, **kwargs)
+
+    async def patch(self, url: str, **kwargs: Any) -> httpx.Response:
+        return await self.request("PATCH", url, **kwargs)
+
+    async def put(self, url: str, **kwargs: Any) -> httpx.Response:
+        return await self.request("PUT", url, **kwargs)
+
+    async def delete(self, url: str, **kwargs: Any) -> httpx.Response:
+        return await self.request("DELETE", url, **kwargs)
+
+
 class DiscordMCPConnector(BaseMCPConnector):
     """
     Discord REST API v10 connector managing multiple servers via a single Bot token.
@@ -252,6 +315,7 @@ class DiscordMCPConnector(BaseMCPConnector):
         api_base_url: str = "https://discord.com/api/v10",
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
         max_forum_output_chars: int = DEFAULT_FORUM_MAX_CHARS,
+        bulk_create_interval_seconds: float = BULK_THREAD_CREATE_INTERVAL_SECONDS,
     ) -> None:
         self._bot_token = bot_token.strip()
         self._permissions_path = Path(permissions_path)
@@ -260,6 +324,7 @@ class DiscordMCPConnector(BaseMCPConnector):
         self._api_base_url = api_base_url.rstrip("/")
         self._http_client_factory = http_client_factory
         self._max_forum_output_chars = max(500, int(max_forum_output_chars))
+        self._bulk_create_interval_seconds = max(0.0, float(bulk_create_interval_seconds))
         self._permissions = load_discord_permissions(self._permissions_path)
 
     def is_configured(self) -> bool:
@@ -361,17 +426,20 @@ class DiscordMCPConnector(BaseMCPConnector):
                 )
         return policy
 
-    def _create_client(self) -> httpx.AsyncClient:
-        if self._http_client_factory is not None:
-            return self._http_client_factory()
-        return httpx.AsyncClient(
-            base_url=self._api_base_url,
-            headers={
-                "Authorization": f"Bot {self._bot_token}",
-                "Content-Type": "application/json",
-            },
-            timeout=15.0,
+    def _create_client(self) -> _RateLimitRetryClient:
+        inner = (
+            self._http_client_factory()
+            if self._http_client_factory is not None
+            else httpx.AsyncClient(
+                base_url=self._api_base_url,
+                headers={
+                    "Authorization": f"Bot {self._bot_token}",
+                    "Content-Type": "application/json",
+                },
+                timeout=15.0,
+            )
         )
+        return _RateLimitRetryClient(inner)
 
     async def _require_approval(self, action_type: str, approval_token: str) -> None:
         if self._session_factory is None:
@@ -895,6 +963,46 @@ class DiscordMCPConnector(BaseMCPConnector):
             f"[Discord: {guild_label} / #{target_id}] 投稿完了 (message_id={msg_id}){extra_note}",
         )
 
+    async def _post_forum_thread(
+        self,
+        client: _RateLimitRetryClient,
+        channel_id: str,
+        *,
+        title: str,
+        content: str,
+        tags: list[str] | None,
+        available_tags: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Create a single forum thread with resolved tags and >2000-char chunk splitting."""
+        tag_ids, tag_labels = _resolve_forum_tag_ids(tags, available_tags)
+        chunks = _split_discord_message(content, max_len=2000)
+        first_chunk = chunks[0] if chunks else ""
+        payload: dict[str, Any] = {
+            "name": title.strip()[:100],
+            "applied_tags": tag_ids,
+            "message": {"content": first_chunk},
+        }
+        post_resp = await client.post(f"/channels/{channel_id}/threads", json=payload)
+        post_resp.raise_for_status()
+        created_thread = post_resp.json() or {}
+        created_thread_id = str(created_thread.get("id", ""))
+
+        for extra_chunk in chunks[1:]:
+            if not created_thread_id:
+                break
+            ext_resp = await client.post(
+                f"/channels/{created_thread_id}/messages",
+                json={"content": extra_chunk},
+            )
+            ext_resp.raise_for_status()
+
+        return {
+            "thread_id": created_thread_id,
+            "title": str(created_thread.get("name", title.strip()[:100])),
+            "applied_tag_ids": tag_ids,
+            "applied_tags": tag_labels,
+        }
+
     async def discord_create_forum_thread(
         self,
         guild_id: str,
@@ -940,27 +1048,14 @@ class DiscordMCPConnector(BaseMCPConnector):
                             json.dumps(result, ensure_ascii=False),
                         )
 
-            tag_ids, tag_labels = _resolve_forum_tag_ids(tags, available_tags)
-            chunks = _split_discord_message(content, max_len=2000)
-            first_chunk = chunks[0] if chunks else ""
-            payload: dict[str, Any] = {
-                "name": title.strip()[:100],
-                "applied_tags": tag_ids,
-                "message": {"content": first_chunk},
-            }
-            post_resp = await client.post(f"/channels/{channel_id}/threads", json=payload)
-            post_resp.raise_for_status()
-            created_thread = post_resp.json() or {}
-            created_thread_id = str(created_thread.get("id", ""))
-
-            for extra_chunk in chunks[1:]:
-                if not created_thread_id:
-                    break
-                ext_resp = await client.post(
-                    f"/channels/{created_thread_id}/messages",
-                    json={"content": extra_chunk},
-                )
-                ext_resp.raise_for_status()
+            created_info = await self._post_forum_thread(
+                client,
+                channel_id,
+                title=title,
+                content=content,
+                tags=tags,
+                available_tags=available_tags,
+            )
 
         guild_label = policy.name or policy.guild_id
         result = {
@@ -969,14 +1064,128 @@ class DiscordMCPConnector(BaseMCPConnector):
             "skipped_existing": False,
             "guild_id": policy.guild_id,
             "channel_id": channel_id,
-            "thread_id": created_thread_id,
-            "title": str(created_thread.get("name", title)),
-            "applied_tag_ids": tag_ids,
-            "applied_tags": tag_labels,
+            **created_info,
         }
         return wrap_untrusted_data(
             f"discord:{guild_label}",
             json.dumps(result, ensure_ascii=False),
+        )
+
+    async def discord_bulk_create_forum_threads(
+        self,
+        guild_id: str,
+        channel_id: str,
+        threads: list[dict[str, Any]],
+        skip_if_exists: bool = True,
+        approval_token: str = "",
+    ) -> str:
+        """
+        Batch-create multiple forum threads in a single tool call with upfront duplicate check.
+
+        Fetches active + all archived threads once, skips duplicates when `skip_if_exists=True`,
+        and paces consecutive creations by `bulk_create_interval_seconds` (default 0.6s).
+        """
+        if not threads:
+            raise ValueError("`threads` must contain at least one thread definition")
+
+        async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            policy = self._check_access(resolved_guild_id, channel_id, require_write=True)
+            if approval_token.strip():
+                await self._require_approval("discord_bulk_create_forum_threads", approval_token)
+
+            ch_resp = await client.get(f"/channels/{channel_id}")
+            ch_resp.raise_for_status()
+            forum_data = ch_resp.json() or {}
+            available_tags = forum_data.get("available_tags") or []
+            tag_map = _build_forum_tag_map(forum_data)
+            forum_name = str(forum_data.get("name", channel_id))
+
+            existing_threads: list[dict[str, Any]] = []
+            if skip_if_exists:
+                existing_threads = await self._collect_forum_threads(
+                    client, policy.guild_id, channel_id
+                )
+
+            created_items: list[dict[str, Any]] = []
+            skipped_items: list[dict[str, Any]] = []
+            failed_items: list[dict[str, Any]] = []
+            created_count_since_start = 0
+
+            for idx, item in enumerate(threads):
+                if not isinstance(item, dict):
+                    failed_items.append({"index": idx, "error": "Invalid thread object"})
+                    continue
+                raw_title = str(item.get("title", "")).strip()
+                raw_content = str(item.get("content", ""))
+                raw_tags = item.get("tags")
+                if not raw_title:
+                    failed_items.append({"index": idx, "error": "Missing thread title"})
+                    continue
+
+                if skip_if_exists:
+                    dup_match = next(
+                        (
+                            th
+                            for th in existing_threads
+                            if _titles_match_similar(raw_title, str(th.get("name", "")))
+                        ),
+                        None,
+                    )
+                    if dup_match is not None:
+                        skipped_items.append(
+                            {
+                                "requested_title": raw_title,
+                                "existing_title": str(dup_match.get("name", "")),
+                                "thread_id": str(dup_match.get("id", "")),
+                                "tags": _format_thread_tags(dup_match, tag_map),
+                            }
+                        )
+                        continue
+
+                if created_count_since_start > 0 and self._bulk_create_interval_seconds > 0:
+                    await asyncio.sleep(self._bulk_create_interval_seconds)
+
+                try:
+                    tag_list = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else None
+                    created_info = await self._post_forum_thread(
+                        client,
+                        channel_id,
+                        title=raw_title,
+                        content=raw_content,
+                        tags=tag_list,
+                        available_tags=available_tags,
+                    )
+                    created_count_since_start += 1
+                    created_items.append(created_info)
+                    existing_threads.append(
+                        {
+                            "id": created_info["thread_id"],
+                            "name": created_info["title"],
+                            "applied_tags": created_info["applied_tag_ids"],
+                        }
+                    )
+                except Exception as exc:
+                    failed_items.append(
+                        {"title": raw_title, "error": mask_secrets(str(exc)) or "Create failed"}
+                    )
+
+        guild_label = policy.name or policy.guild_id
+        summary = {
+            "citation": f"[Discord: {guild_label} / #{forum_name}]",
+            "status": "completed",
+            "guild_id": policy.guild_id,
+            "channel_id": channel_id,
+            "created_count": len(created_items),
+            "skipped_count": len(skipped_items),
+            "failed_count": len(failed_items),
+            "created": created_items,
+            "skipped": skipped_items,
+            "failed": failed_items,
+        }
+        return wrap_untrusted_data(
+            f"discord:{guild_label}",
+            json.dumps(summary, ensure_ascii=False),
         )
 
     async def discord_update_thread(
@@ -1305,6 +1514,14 @@ class DiscordMCPConnector(BaseMCPConnector):
                 name="discord_create_forum_thread",
                 description="Create a new thread in a read_write Discord forum channel, resolving tag names to tag IDs and checking skip_if_exists for duplicates.",
                 handler=self.discord_create_forum_thread,
+                requires_approval=False,
+                source_type="discord",
+                already_wrapped=True,
+            ),
+            MCPTool(
+                name="discord_bulk_create_forum_threads",
+                description="Batch-create multiple forum threads in a single call for a read_write Discord forum channel, skipping existing threads once upfront and pacing creations to avoid rate limits.",
+                handler=self.discord_bulk_create_forum_threads,
                 requires_approval=False,
                 source_type="discord",
                 already_wrapped=True,
