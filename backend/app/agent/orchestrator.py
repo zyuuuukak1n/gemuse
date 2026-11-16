@@ -49,6 +49,7 @@ _SYSTEM_PROMPT_TEMPLATE = """You are Gemuse, a secure, self-hosted personal AI a
 - Keep inline citation tags unobtrusive: place them at the **end** of each item or paragraph rather than after every single line.
 - Google ドキュメント・スプレッドシート・スライド・Drive ファイルを作成・編集・検索した際は、生のファイルIDだけを羅列せず、**必ず `[ファイルタイトル](公式URL)` 形式の Markdown リンク**を出力すること。
 - 作成・取得したドキュメントの本文抜粋や、スプレッドシートの内容（Markdown テーブル形式）をプレビューとして本文中に見やすく提示すること。
+- Google スプレッドシートに表を作成・更新した際は、`sheets_format_table` を呼び出してネイティブテーブル化・ヘッダー装飾・罫線・列幅自動調整を適用し、見やすく仕上げること（ステータス列などの条件付き色分けが必要な場合は `sheets_apply_formatting` も併用すること）。
 - After receiving external tool results, ALWAYS produce a complete final user-facing answer in Japanese. Never end a turn with empty text.
 
 ## Layer 1: Core Memory

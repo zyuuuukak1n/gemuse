@@ -5,7 +5,8 @@ Services:
   `calendar_create_event`, `calendar_update_event`, `calendar_delete_event`)
 - Drive v3 (`drive_search_files`, `drive_read_text_file`, `drive_create_folder`, `drive_move_or_rename`)
 - Docs v1 (`docs_create_document`, `docs_get_document`, `docs_append_text`, `docs_replace_text`)
-- Sheets v4 (`sheets_create_spreadsheet`, `sheets_read_range`, `sheets_append_rows`, `sheets_update_values`)
+- Sheets v4 (`sheets_create_spreadsheet`, `sheets_read_range`, `sheets_append_rows`, `sheets_update_values`,
+  `sheets_format_table`, `sheets_apply_formatting`)
 - Slides v1 (`slides_create_presentation`, `slides_get_presentation`, `slides_add_slide`)
 - Tasks v1 (`tasks_list`, `tasks_create`, `tasks_complete`)
 - Contacts / People v1 (`contacts_search`)
@@ -14,6 +15,7 @@ Services:
 
 import asyncio
 import json
+import re
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Literal, TypeVar
@@ -152,6 +154,246 @@ def _build_create_slide_requests(
     if body:
         requests.append({"insertText": {"objectId": body_id, "text": body}})
     return slide_id, requests
+
+
+_A1_CELL_RE = re.compile(r"^\$?([A-Za-z]+)?\$?(\d+)?$")
+
+
+def _hex_to_sheets_color(hex_color: str) -> dict[str, float]:
+    """Convert `#RRGGBB` or `#RGB` hex color code to Google Sheets RGB color dict."""
+    cleaned = hex_color.strip().lstrip("#")
+    if len(cleaned) == 3:
+        cleaned = "".join(ch * 2 for ch in cleaned)
+    if len(cleaned) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in cleaned):
+        raise ValueError(f"Invalid hex color code: {hex_color!r}")
+    return {
+        "red": round(int(cleaned[0:2], 16) / 255.0, 4),
+        "green": round(int(cleaned[2:4], 16) / 255.0, 4),
+        "blue": round(int(cleaned[4:6], 16) / 255.0, 4),
+    }
+
+
+def _col_letters_to_index(letters: str) -> int:
+    """Convert 1-based Excel/Sheets column letters (`A` -> 0, `AA` -> 26)."""
+    idx = 0
+    for ch in letters.upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _split_sheet_and_range(range_a1: str) -> tuple[str | None, str]:
+    """Split `'Sheet 1'!A1:B2` into `(sheet_name, cell_range)`."""
+    raw = range_a1.strip()
+    if "!" not in raw:
+        return None, raw
+    sheet_part, cell_part = raw.split("!", 1)
+    sheet_part = sheet_part.strip()
+    if sheet_part.startswith("'") and sheet_part.endswith("'") and len(sheet_part) >= 2:
+        sheet_part = sheet_part[1:-1].replace("''", "'")
+    return sheet_part, cell_part.strip()
+
+
+def _a1_to_grid_range(
+    range_a1: str,
+    sheet_id_by_title: dict[str, int] | None = None,
+    *,
+    default_sheet_id: int = 0,
+) -> dict[str, Any]:
+    """
+    Convert an A1 notation string (`A8:K20`, `シート1!A8:K20`, etc.) into a Google Sheets `GridRange`.
+
+    Row and column bounds follow Google Sheets API semantics (0-indexed start, exclusive end).
+    """
+    sheet_name, cell_expr = _split_sheet_and_range(range_a1)
+    if sheet_name is not None:
+        if not sheet_id_by_title or sheet_name not in sheet_id_by_title:
+            raise ValueError(f"Sheet '{sheet_name}' not found in spreadsheet metadata")
+        sheet_id = sheet_id_by_title[sheet_name]
+    else:
+        sheet_id = default_sheet_id
+
+    if ":" in cell_expr:
+        start_token, end_token = cell_expr.split(":", 1)
+    else:
+        start_token, end_token = cell_expr, cell_expr
+
+    m_start = _A1_CELL_RE.match(start_token.strip())
+    m_end = _A1_CELL_RE.match(end_token.strip())
+    if not m_start or not m_end or (not m_start.group(1) and not m_start.group(2)):
+        raise ValueError(f"Invalid A1 range notation: {range_a1!r}")
+
+    start_col_str, start_row_str = m_start.group(1), m_start.group(2)
+    end_col_str, end_row_str = m_end.group(1), m_end.group(2)
+
+    grid_range: dict[str, Any] = {"sheetId": sheet_id}
+    if start_row_str:
+        grid_range["startRowIndex"] = max(0, int(start_row_str) - 1)
+    if end_row_str:
+        grid_range["endRowIndex"] = max(1, int(end_row_str))
+    elif start_row_str and ":" not in cell_expr:
+        grid_range["endRowIndex"] = int(start_row_str)
+
+    if start_col_str:
+        grid_range["startColumnIndex"] = _col_letters_to_index(start_col_str)
+    if end_col_str:
+        grid_range["endColumnIndex"] = _col_letters_to_index(end_col_str) + 1
+    elif start_col_str and ":" not in cell_expr:
+        grid_range["endColumnIndex"] = _col_letters_to_index(start_col_str) + 1
+
+    return grid_range
+
+
+def _build_format_table_requests(
+    grid_range: dict[str, Any],
+    *,
+    table_name: str,
+    include_native_table: bool,
+    include_basic_filter: bool,
+    header_bg_hex: str,
+    header_text_hex: str,
+    zebra_striping: bool,
+    add_borders: bool,
+    auto_resize_columns: bool,
+    wrap_text: bool,
+    freeze_header_row: bool,
+) -> list[dict[str, Any]]:
+    """Construct Google Sheets batchUpdate requests for table creation, styling, borders, and sizing."""
+    requests: list[dict[str, Any]] = []
+    sheet_id = int(grid_range["sheetId"])
+    start_row = int(grid_range.get("startRowIndex", 0))
+    end_row = grid_range.get("endRowIndex")
+    start_col = int(grid_range.get("startColumnIndex", 0))
+    end_col = grid_range.get("endColumnIndex")
+
+    if include_native_table:
+        safe_name = re.sub(r"\s+", "_", table_name.strip())[:50] or "DataTable"
+        requests.append(
+            {
+                "addTable": {
+                    "table": {
+                        "name": safe_name,
+                        "range": grid_range,
+                    }
+                }
+            }
+        )
+
+    header_range: dict[str, Any] = {
+        "sheetId": sheet_id,
+        "startRowIndex": start_row,
+        "endRowIndex": start_row + 1,
+    }
+    if start_col is not None:
+        header_range["startColumnIndex"] = start_col
+    if end_col is not None:
+        header_range["endColumnIndex"] = end_col
+
+    header_format: dict[str, Any] = {
+        "backgroundColor": _hex_to_sheets_color(header_bg_hex),
+        "textFormat": {
+            "bold": True,
+            "foregroundColor": _hex_to_sheets_color(header_text_hex),
+        },
+        "horizontalAlignment": "CENTER",
+        "verticalAlignment": "MIDDLE",
+        "wrapStrategy": "WRAP" if wrap_text else "OVERFLOW_CELL",
+    }
+    requests.append(
+        {
+            "repeatCell": {
+                "range": header_range,
+                "cell": {"userEnteredFormat": header_format},
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)",
+            }
+        }
+    )
+
+    if end_row is None or int(end_row) > start_row + 1:
+        data_range: dict[str, Any] = {
+            "sheetId": sheet_id,
+            "startRowIndex": start_row + 1,
+        }
+        if end_row is not None:
+            data_range["endRowIndex"] = int(end_row)
+        if start_col is not None:
+            data_range["startColumnIndex"] = start_col
+        if end_col is not None:
+            data_range["endColumnIndex"] = end_col
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": data_range,
+                    "cell": {
+                        "userEnteredFormat": {
+                            "verticalAlignment": "MIDDLE",
+                            "wrapStrategy": "WRAP" if wrap_text else "CLIP",
+                        }
+                    },
+                    "fields": "userEnteredFormat(verticalAlignment,wrapStrategy)",
+                }
+            }
+        )
+
+    if zebra_striping and not include_native_table:
+        requests.append(
+            {
+                "addBanding": {
+                    "bandedRange": {
+                        "range": grid_range,
+                        "rowProperties": {
+                            "headerColor": _hex_to_sheets_color(header_bg_hex),
+                            "firstBandColor": {"red": 1.0, "green": 1.0, "blue": 1.0},
+                            "secondBandColor": {"red": 0.945, "green": 0.961, "blue": 0.976},
+                        },
+                    }
+                }
+            }
+        )
+
+    if include_basic_filter and not include_native_table:
+        requests.append({"setBasicFilter": {"filter": {"range": grid_range}}})
+
+    if add_borders:
+        outer = {"style": "SOLID_MEDIUM", "width": 2, "color": {"red": 0.392, "green": 0.455, "blue": 0.545}}
+        inner = {"style": "SOLID", "width": 1, "color": {"red": 0.796, "green": 0.835, "blue": 0.882}}
+        requests.append(
+            {
+                "updateBorders": {
+                    "range": grid_range,
+                    "top": outer,
+                    "bottom": outer,
+                    "left": outer,
+                    "right": outer,
+                    "innerHorizontal": inner,
+                    "innerVertical": inner,
+                }
+            }
+        )
+
+    if freeze_header_row:
+        requests.append(
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": sheet_id,
+                        "gridProperties": {"frozenRowCount": start_row + 1},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            }
+        )
+
+    if auto_resize_columns:
+        dim_range: dict[str, Any] = {
+            "sheetId": sheet_id,
+            "dimension": "COLUMNS",
+            "startIndex": start_col,
+        }
+        if end_col is not None:
+            dim_range["endIndex"] = int(end_col)
+        requests.append({"autoResizeDimensions": {"dimensions": dim_range}})
+
+    return requests
 
 
 class GoogleWorkspaceMCPConnector(BaseMCPConnector):
@@ -1223,6 +1465,327 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
         }
         return wrap_untrusted_data("google_sheets:update", json.dumps(result, ensure_ascii=False))
 
+    async def _resolve_grid_range(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        spreadsheet_id: str,
+        range_a1: str,
+    ) -> dict[str, Any]:
+        """Fetch spreadsheet sheetId metadata and resolve A1 notation to GridRange."""
+        meta_resp = await client.get(
+            f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}",
+            headers=headers,
+            params={"fields": "sheets(properties(sheetId,title))"},
+        )
+        meta_resp.raise_for_status()
+        sheets_meta = meta_resp.json().get("sheets") or []
+
+        sheet_id_by_title: dict[str, int] = {}
+        default_sheet_id = 0
+        for idx, sheet in enumerate(sheets_meta):
+            props = sheet.get("properties") or {}
+            if "sheetId" in props:
+                sid = int(props["sheetId"])
+                if idx == 0:
+                    default_sheet_id = sid
+                title = props.get("title")
+                if isinstance(title, str) and title:
+                    sheet_id_by_title[title] = sid
+
+        return _a1_to_grid_range(
+            range_a1,
+            sheet_id_by_title,
+            default_sheet_id=default_sheet_id,
+        )
+
+    async def sheets_format_table(
+        self,
+        spreadsheet_id: str,
+        range_a1: str,
+        table_name: str = "DataTable",
+        convert_to_native_table: bool = True,
+        header_bg_hex: str = "#1E3A5F",
+        header_text_hex: str = "#FFFFFF",
+        zebra_striping: bool = True,
+        add_borders: bool = True,
+        auto_resize_columns: bool = True,
+        wrap_text: bool = True,
+        freeze_header_row: bool = False,
+        account: GoogleAccountName = "private",
+    ) -> str:
+        """
+        Convert a sheet range into a styled Google Sheets table in one batchUpdate transaction.
+
+        Falls back gracefully to banding + basic filter + formatting if `addTable` fails
+        (e.g., an overlapping table already exists).
+        """
+        acct = self._resolve_single_account(account)
+        async with self._create_client() as client:
+            token = await self._get_access_token(client, acct)
+            headers = {"Authorization": f"Bearer {token}"}
+            grid_range = await self._resolve_grid_range(client, headers, spreadsheet_id, range_a1)
+
+            primary_reqs = _build_format_table_requests(
+                grid_range,
+                table_name=table_name,
+                include_native_table=convert_to_native_table,
+                include_basic_filter=False,
+                header_bg_hex=header_bg_hex,
+                header_text_hex=header_text_hex,
+                zebra_striping=zebra_striping,
+                add_borders=add_borders,
+                auto_resize_columns=auto_resize_columns,
+                wrap_text=wrap_text,
+                freeze_header_row=freeze_header_row,
+            )
+
+            batch_url = f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate"
+            resp = await client.post(batch_url, headers=headers, json={"requests": primary_reqs})
+
+            native_applied = convert_to_native_table
+            fallback_used = False
+
+            if resp.status_code >= 400 and convert_to_native_table:
+                logger.info(
+                    "Native addTable failed; falling back to banding + basic filter formatting",
+                    extra={"spreadsheet_id": spreadsheet_id, "status_code": resp.status_code},
+                )
+                fallback_used = True
+                native_applied = False
+                fallback_reqs = _build_format_table_requests(
+                    grid_range,
+                    table_name=table_name,
+                    include_native_table=False,
+                    include_basic_filter=True,
+                    header_bg_hex=header_bg_hex,
+                    header_text_hex=header_text_hex,
+                    zebra_striping=zebra_striping,
+                    add_borders=add_borders,
+                    auto_resize_columns=auto_resize_columns,
+                    wrap_text=wrap_text,
+                    freeze_header_row=freeze_header_row,
+                )
+                resp = await client.post(batch_url, headers=headers, json={"requests": fallback_reqs})
+                if resp.status_code >= 400:
+                    # Final defensive fallback without banding/filter if those already exist too
+                    minimal_reqs = _build_format_table_requests(
+                        grid_range,
+                        table_name=table_name,
+                        include_native_table=False,
+                        include_basic_filter=False,
+                        header_bg_hex=header_bg_hex,
+                        header_text_hex=header_text_hex,
+                        zebra_striping=False,
+                        add_borders=add_borders,
+                        auto_resize_columns=auto_resize_columns,
+                        wrap_text=wrap_text,
+                        freeze_header_row=freeze_header_row,
+                    )
+                    resp = await client.post(
+                        batch_url, headers=headers, json={"requests": minimal_reqs}
+                    )
+
+            resp.raise_for_status()
+            batch_data = resp.json()
+
+        result = {
+            "citation": "[MCP: sheets]",
+            "status": "formatted",
+            "account": acct,
+            "spreadsheet_id": spreadsheet_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+            "range": range_a1,
+            "grid_range": grid_range,
+            "table_name": table_name,
+            "native_table_applied": native_applied,
+            "fallback_used": fallback_used,
+            "replies_count": len(batch_data.get("replies") or []),
+        }
+        return wrap_untrusted_data("google_sheets:format_table", json.dumps(result, ensure_ascii=False))
+
+    async def sheets_apply_formatting(
+        self,
+        spreadsheet_id: str,
+        range_a1: str,
+        background_hex: str | None = None,
+        text_hex: str | None = None,
+        bold: bool | None = None,
+        font_size: int | None = None,
+        horizontal_alignment: Literal["LEFT", "CENTER", "RIGHT"] | None = None,
+        vertical_alignment: Literal["TOP", "MIDDLE", "BOTTOM"] | None = None,
+        wrap_strategy: Literal["OVERFLOW_CELL", "CLIP", "WRAP"] | None = None,
+        add_borders: bool = False,
+        column_width_px: int | None = None,
+        conditional_rules: list[dict[str, Any]] | None = None,
+        account: GoogleAccountName = "private",
+    ) -> str:
+        """
+        Apply cell styles, borders, column pixel width, and conditional formatting rules via batchUpdate.
+
+        `conditional_rules` accepts a list of dicts, e.g.:
+        `[{"text_contains": "選考中", "background_hex": "#DCFCE7", "text_hex": "#166534", "bold": True}]`
+        """
+        acct = self._resolve_single_account(account)
+        async with self._create_client() as client:
+            token = await self._get_access_token(client, acct)
+            headers = {"Authorization": f"Bearer {token}"}
+            grid_range = await self._resolve_grid_range(client, headers, spreadsheet_id, range_a1)
+
+            requests: list[dict[str, Any]] = []
+            cell_format: dict[str, Any] = {}
+            field_paths: list[str] = []
+
+            if background_hex:
+                cell_format["backgroundColor"] = _hex_to_sheets_color(background_hex)
+                field_paths.append("userEnteredFormat.backgroundColor")
+
+            text_format: dict[str, Any] = {}
+            if text_hex:
+                text_format["foregroundColor"] = _hex_to_sheets_color(text_hex)
+                field_paths.append("userEnteredFormat.textFormat.foregroundColor")
+            if bold is not None:
+                text_format["bold"] = bool(bold)
+                field_paths.append("userEnteredFormat.textFormat.bold")
+            if font_size is not None:
+                text_format["fontSize"] = max(6, min(72, int(font_size)))
+                field_paths.append("userEnteredFormat.textFormat.fontSize")
+            if text_format:
+                cell_format["textFormat"] = text_format
+
+            if horizontal_alignment:
+                cell_format["horizontalAlignment"] = horizontal_alignment
+                field_paths.append("userEnteredFormat.horizontalAlignment")
+            if vertical_alignment:
+                cell_format["verticalAlignment"] = vertical_alignment
+                field_paths.append("userEnteredFormat.verticalAlignment")
+            if wrap_strategy:
+                cell_format["wrapStrategy"] = wrap_strategy
+                field_paths.append("userEnteredFormat.wrapStrategy")
+
+            if cell_format and field_paths:
+                requests.append(
+                    {
+                        "repeatCell": {
+                            "range": grid_range,
+                            "cell": {"userEnteredFormat": cell_format},
+                            "fields": ",".join(field_paths),
+                        }
+                    }
+                )
+
+            if add_borders:
+                border_style = {
+                    "style": "SOLID",
+                    "width": 1,
+                    "color": {"red": 0.58, "green": 0.639, "blue": 0.722},
+                }
+                requests.append(
+                    {
+                        "updateBorders": {
+                            "range": grid_range,
+                            "top": border_style,
+                            "bottom": border_style,
+                            "left": border_style,
+                            "right": border_style,
+                            "innerHorizontal": border_style,
+                            "innerVertical": border_style,
+                        }
+                    }
+                )
+
+            if column_width_px is not None:
+                start_col = int(grid_range.get("startColumnIndex", 0))
+                dim_range: dict[str, Any] = {
+                    "sheetId": int(grid_range["sheetId"]),
+                    "dimension": "COLUMNS",
+                    "startIndex": start_col,
+                }
+                if "endColumnIndex" in grid_range:
+                    dim_range["endIndex"] = int(grid_range["endColumnIndex"])
+                requests.append(
+                    {
+                        "updateDimensionProperties": {
+                            "range": dim_range,
+                            "properties": {"pixelSize": max(20, min(1000, int(column_width_px)))},
+                            "fields": "pixelSize",
+                        }
+                    }
+                )
+
+            for rule_idx, rule in enumerate(conditional_rules or []):
+                if not isinstance(rule, dict):
+                    continue
+                exact_val = rule.get("exact_text")
+                contains_val = rule.get("text_contains") or rule.get("contains") or rule.get("value")
+                if exact_val is not None and str(exact_val) != "":
+                    cond_type = "TEXT_EQ"
+                    cond_val = str(exact_val)
+                elif contains_val is not None and str(contains_val) != "":
+                    cond_type = "TEXT_CONTAINS"
+                    cond_val = str(contains_val)
+                else:
+                    continue
+
+                cond_fmt: dict[str, Any] = {}
+                if rule.get("background_hex"):
+                    cond_fmt["backgroundColor"] = _hex_to_sheets_color(str(rule["background_hex"]))
+                cond_tf: dict[str, Any] = {}
+                if rule.get("text_hex"):
+                    cond_tf["foregroundColor"] = _hex_to_sheets_color(str(rule["text_hex"]))
+                if "bold" in rule and rule["bold"] is not None:
+                    cond_tf["bold"] = bool(rule["bold"])
+                if cond_tf:
+                    cond_fmt["textFormat"] = cond_tf
+                if not cond_fmt:
+                    continue
+
+                requests.append(
+                    {
+                        "addConditionalFormatRule": {
+                            "rule": {
+                                "ranges": [grid_range],
+                                "booleanRule": {
+                                    "condition": {
+                                        "type": cond_type,
+                                        "values": [{"userEnteredValue": cond_val}],
+                                    },
+                                    "format": cond_fmt,
+                                },
+                            },
+                            "index": rule_idx,
+                        }
+                    }
+                )
+
+            if not requests:
+                raise ValueError(
+                    "At least one formatting option, column width, border, or conditional rule must be specified"
+                )
+
+            resp = await client.post(
+                f"https://sheets.googleapis.com/v4/spreadsheets/{spreadsheet_id}:batchUpdate",
+                headers=headers,
+                json={"requests": requests},
+            )
+            resp.raise_for_status()
+            batch_data = resp.json()
+
+        result = {
+            "citation": "[MCP: sheets]",
+            "status": "formatting_applied",
+            "account": acct,
+            "spreadsheet_id": spreadsheet_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+            "range": range_a1,
+            "grid_range": grid_range,
+            "applied_requests_count": len(requests),
+            "replies_count": len(batch_data.get("replies") or []),
+        }
+        return wrap_untrusted_data(
+            "google_sheets:apply_formatting", json.dumps(result, ensure_ascii=False)
+        )
+
     # ------------------------------------------------------------------
     # Google Slides v1
     # ------------------------------------------------------------------
@@ -1766,6 +2329,22 @@ class GoogleWorkspaceMCPConnector(BaseMCPConnector):
                         name="sheets_update_values",
                         description="Update cell values at an A1 range in a Google Sheet (defaults to private).",
                         handler=self.sheets_update_values,
+                        requires_approval=False,
+                        source_type="google_sheets",
+                        already_wrapped=True,
+                    ),
+                    MCPTool(
+                        name="sheets_format_table",
+                        description="Convert a spreadsheet range into a native Google Sheets Table and apply header styling, borders, zebra striping, wrap text, freeze header, and auto column sizing (defaults to private).",
+                        handler=self.sheets_format_table,
+                        requires_approval=False,
+                        source_type="google_sheets",
+                        already_wrapped=True,
+                    ),
+                    MCPTool(
+                        name="sheets_apply_formatting",
+                        description="Apply cell colors, bold/font size, alignment, borders, column widths, or text-matching conditional formatting rules to a Google Sheet range (defaults to private).",
+                        handler=self.sheets_apply_formatting,
                         requires_approval=False,
                         source_type="google_sheets",
                         already_wrapped=True,

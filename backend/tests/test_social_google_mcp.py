@@ -979,3 +979,170 @@ async def test_google_calendar_subcalendars_parallel_fetch_conflict_and_create_b
             calendar_name="NonExistentCalendar",
             approval_token=tok3,
         )
+
+
+def test_a1_to_grid_range_conversion() -> None:
+    from app.mcp_hub.servers.google_mcp import _a1_to_grid_range
+
+    sheet_map = {"シート1": 101, "就活 管理": 202}
+
+    gr1 = _a1_to_grid_range("A8:K20", sheet_map, default_sheet_id=101)
+    assert gr1 == {
+        "sheetId": 101,
+        "startRowIndex": 7,
+        "endRowIndex": 20,
+        "startColumnIndex": 0,
+        "endColumnIndex": 11,
+    }
+
+    gr2 = _a1_to_grid_range("'就活 管理'!B2:AA15", sheet_map, default_sheet_id=101)
+    assert gr2 == {
+        "sheetId": 202,
+        "startRowIndex": 1,
+        "endRowIndex": 15,
+        "startColumnIndex": 1,
+        "endColumnIndex": 27,
+    }
+
+    gr_sheet = _a1_to_grid_range("シート1!C3", sheet_map)
+    assert gr_sheet == {
+        "sheetId": 101,
+        "startRowIndex": 2,
+        "endRowIndex": 3,
+        "startColumnIndex": 2,
+        "endColumnIndex": 3,
+    }
+
+    with pytest.raises(ValueError, match="not found"):
+        _a1_to_grid_range("存在しないシート!A1:B2", sheet_map)
+
+
+async def test_sheets_format_table_fallback_and_apply_formatting(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    batch_payloads: list[dict[str, object]] = []
+    fail_native_table = {"value": False}
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "oauth2.googleapis.com/token" in url:
+            return httpx.Response(200, json={"access_token": "fake-google-access-token"})
+        if url.startswith("https://sheets.googleapis.com/v4/spreadsheets/sp-123") and request.method == "GET":
+            return httpx.Response(
+                200,
+                json={
+                    "sheets": [
+                        {"properties": {"sheetId": 0, "title": "Sheet1"}},
+                        {"properties": {"sheetId": 42, "title": "シート1"}},
+                    ]
+                },
+            )
+        if url == "https://sheets.googleapis.com/v4/spreadsheets/sp-123:batchUpdate" and request.method == "POST":
+            payload = json.loads(request.content.decode("utf-8"))
+            batch_payloads.append(payload)
+            reqs = payload.get("requests", [])
+            has_add_table = any("addTable" in r for r in reqs)
+            if fail_native_table["value"] and has_add_table:
+                return httpx.Response(
+                    400,
+                    json={"error": {"code": 400, "message": "Overlapping table already exists"}},
+                )
+            return httpx.Response(
+                200,
+                json={"spreadsheetId": "sp-123", "replies": [{} for _ in reqs]},
+            )
+        return httpx.Response(404)
+
+    transport = httpx.MockTransport(_handler)
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    connector = GoogleWorkspaceMCPConnector(
+        client_id="gid",
+        client_secret="gsecret",
+        refresh_token="grefresh",
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(transport=transport),
+    )
+
+    tool_names = {t.name for t in connector.get_tools()}
+    assert "sheets_format_table" in tool_names
+    assert "sheets_apply_formatting" in tool_names
+
+    # 1. Native table formatting in one transaction
+    fmt_out = await connector.sheets_format_table(
+        spreadsheet_id="sp-123",
+        range_a1="シート1!A8:K20",
+        table_name="Shukatsu Table",
+        freeze_header_row=True,
+    )
+    assert '"native_table_applied": true' in fmt_out
+    assert '"fallback_used": false' in fmt_out
+    assert '"sheetId": 42' in fmt_out
+
+    first_reqs = batch_payloads[0]["requests"]  # type: ignore[index]
+    req_keys = [next(iter(r.keys())) for r in first_reqs]  # type: ignore[union-attr]
+    assert "addTable" in req_keys
+    assert "repeatCell" in req_keys
+    assert "updateBorders" in req_keys
+    assert "updateSheetProperties" in req_keys
+    assert "autoResizeDimensions" in req_keys
+    assert "addBanding" not in req_keys  # omitted when addTable succeeds
+
+    add_table_req = next(r["addTable"]["table"] for r in first_reqs if "addTable" in r)  # type: ignore[index]
+    assert add_table_req["name"] == "Shukatsu_Table"
+    assert add_table_req["range"] == {
+        "sheetId": 42,
+        "startRowIndex": 7,
+        "endRowIndex": 20,
+        "startColumnIndex": 0,
+        "endColumnIndex": 11,
+    }
+
+    # 2. Fallback when addTable fails (e.g., table already exists) -> retries with banding + basicFilter
+    fail_native_table["value"] = True
+    fallback_out = await connector.sheets_format_table(
+        spreadsheet_id="sp-123",
+        range_a1="A8:K20",
+        table_name="ExistingTable",
+    )
+    assert '"native_table_applied": false' in fallback_out
+    assert '"fallback_used": true' in fallback_out
+    fallback_reqs = batch_payloads[-1]["requests"]  # type: ignore[index]
+    fb_keys = [next(iter(r.keys())) for r in fallback_reqs]  # type: ignore[union-attr]
+    assert "addTable" not in fb_keys
+    assert "addBanding" in fb_keys
+    assert "setBasicFilter" in fb_keys
+    assert "updateBorders" in fb_keys
+
+    # 3. sheets_apply_formatting applies styles, column width, and conditional rules
+    cond_out = await connector.sheets_apply_formatting(
+        spreadsheet_id="sp-123",
+        range_a1="シート1!E9:E20",
+        bold=True,
+        font_size=11,
+        horizontal_alignment="CENTER",
+        column_width_px=180,
+        conditional_rules=[
+            {
+                "text_contains": "選考中",
+                "background_hex": "#DCFCE7",
+                "text_hex": "#166534",
+                "bold": True,
+            },
+            {
+                "text_contains": "辞退",
+                "background_hex": "#F1F5F9",
+                "text_hex": "#475569",
+            },
+        ],
+    )
+    assert '"status": "formatting_applied"' in cond_out
+    apply_reqs = batch_payloads[-1]["requests"]  # type: ignore[index]
+    cond_rules = [r["addConditionalFormatRule"] for r in apply_reqs if "addConditionalFormatRule" in r]  # type: ignore[index]
+    assert len(cond_rules) == 2
+    assert cond_rules[0]["rule"]["booleanRule"]["condition"] == {
+        "type": "TEXT_CONTAINS",
+        "values": [{"userEnteredValue": "選考中"}],
+    }
+    dim_reqs = [r["updateDimensionProperties"] for r in apply_reqs if "updateDimensionProperties" in r]  # type: ignore[index]
+    assert dim_reqs[0]["properties"] == {"pixelSize": 180}
