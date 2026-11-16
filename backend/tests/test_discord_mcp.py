@@ -239,3 +239,194 @@ async def test_discord_cross_server_search_and_approved_pin_updates(
     assert "ピン留めメッセージを更新しました" in pin_edit_res
     assert any(m == "PATCH" and p.endswith("/messages/pin-55") for m, p, _ in recorded)
 
+
+async def test_discord_guild_name_resolution_forum_threads_and_search(
+    tmp_path: Path,
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    perm_file = tmp_path / "discord_permissions_forum.yaml"
+    perm_file.write_text(
+        """
+version: "1.0.0"
+default_policy: disabled
+servers:
+  - guild_id: "7001"
+    name: "就活管理"
+    permission: "read_only"
+    allowed_channels: []
+  - guild_id: "7002"
+    name: ""
+    permission: "read_only"
+    allowed_channels: []
+  - guild_id: "7003"
+    name: "禁止サーバー"
+    permission: "disabled"
+    allowed_channels: []
+""",
+        encoding="utf-8",
+    )
+
+    recorded: list[tuple[str, str, str]] = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        recorded.append((request.method, str(request.url), request.content.decode("utf-8", errors="ignore")))
+        path = request.url.path
+
+        if path == "/api/v10/users/@me/guilds":
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "7001", "name": "就活管理"},
+                    {"id": "7002", "name": "研究室ゼミ"},
+                    {"id": "7003", "name": "禁止サーバー"},
+                ],
+            )
+        if path == "/api/v10/guilds/7001/channels":
+            return httpx.Response(
+                200,
+                json=[
+                    {"id": "8001", "name": "一般連絡", "type": 0},
+                    {"id": "8002", "name": "🏢｜【総合】企業別", "type": 15},
+                    {"id": "8003", "name": "雑談フォーラム", "type": 15},
+                ],
+            )
+        if path == "/api/v10/guilds/7002/channels":
+            return httpx.Response(
+                200,
+                json=[{"id": "8101", "name": "ゼミ資料", "type": 0}],
+            )
+        if path == "/api/v10/channels/8002":
+            return httpx.Response(
+                200,
+                json={"id": "8002", "name": "🏢｜【総合】企業別", "type": 15},
+            )
+        if path == "/api/v10/channels/8101":
+            return httpx.Response(
+                200,
+                json={"id": "8101", "name": "ゼミ資料", "type": 0},
+            )
+        if path == "/api/v10/guilds/7001/threads/active":
+            return httpx.Response(
+                200,
+                json={
+                    "threads": [
+                        {"id": "th-1", "parent_id": "8002", "name": "アルファ株式会社"},
+                        {"id": "th-other", "parent_id": "8003", "name": "別フォーラムの雑談"},
+                    ]
+                },
+            )
+        if path == "/api/v10/channels/8002/threads/archived/public":
+            return httpx.Response(
+                200,
+                json={
+                    "threads": [
+                        # Duplicate th-1 should be deduplicated; th-2 is archived
+                        {"id": "th-1", "parent_id": "8002", "name": "アルファ株式会社"},
+                        {"id": "th-2", "parent_id": "8002", "name": "ベータテック株式会社"},
+                    ]
+                },
+            )
+        if path == "/api/v10/channels/8003/threads/archived/public":
+            return httpx.Response(200, json={"threads": []})
+        if path == "/api/v10/channels/8001/messages":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "msg-txt-1",
+                        "content": "今週のES提出スケジュールまとめ",
+                        "timestamp": "2026-11-15T09:00:00Z",
+                        "author": {"username": "career-bot"},
+                    }
+                ],
+            )
+        if path == "/api/v10/channels/th-1/messages":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "msg-th1-1",
+                        "content": "二次面接の日程調整メールを受信（INTERVIEW_ALPHA）",
+                        "timestamp": "2026-11-15T12:00:00Z",
+                        "author": {"username": "shukatsu"},
+                    }
+                ],
+            )
+        if path == "/api/v10/channels/th-2/messages":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "msg-th2-1",
+                        "content": "書類選考通過、次回Webテスト案内",
+                        "timestamp": "2026-11-10T15:30:00Z",
+                        "author": {"username": "shukatsu"},
+                    }
+                ],
+            )
+        if path == "/api/v10/channels/8101/messages":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "msg-semi-1",
+                        "content": "来週のゼミ発表資料",
+                        "timestamp": "2026-11-14T18:00:00Z",
+                        "author": {"username": "prof"},
+                    }
+                ],
+            )
+        return httpx.Response(404, json={"message": "Not Found"})
+
+    approval = ApprovalService(TEST_HMAC_SECRET)
+    transport = httpx.MockTransport(_handler)
+    connector = DiscordMCPConnector(
+        bot_token="discord-test-bot-token",
+        permissions_path=perm_file,
+        approval_service=approval,
+        session_factory=db_session_factory,
+        http_client_factory=lambda: httpx.AsyncClient(
+            base_url="https://discord.com/api/v10",
+            transport=transport,
+        ),
+    )
+
+    # 1. discord_list_channels explicitly prints guild_id and channel type
+    channels_out = await connector.discord_list_channels()
+    assert "guild_id=7001" in channels_out
+    assert "type=forum" in channels_out
+    assert "type=text" in channels_out
+    assert "🏢｜【総合】企業別" in channels_out
+
+    # 2a. Server name ("就活管理") resolves to numeric guild_id=7001 and expands forum type 15
+    forum_out = await connector.discord_read_history(guild_id="就活管理", channel_id="8002")
+    assert "[Thread: アルファ株式会社]" in forum_out
+    assert "[Thread: ベータテック株式会社]" in forum_out
+    assert "二次面接の日程調整メールを受信" in forum_out
+    assert "書類選考通過、次回Webテスト案内" in forum_out
+    assert "別フォーラムの雑談" not in forum_out
+    # Deduplicated: th-1 messages fetched once
+    th1_fetches = [u for m, u, _ in recorded if m == "GET" and "/channels/th-1/messages" in u]
+    assert len(th1_fetches) == 1
+    assert "limit=20" in th1_fetches[0]
+
+    # 2b. Server name resolved via /users/@me/guilds fallback when YAML name is empty
+    semi_out = await connector.discord_read_history(guild_id="研究室ゼミ", channel_id="8101")
+    assert "来週のゼミ発表資料" in semi_out
+
+    # 2c. Disabled server resolved by name still enforces whitelist PermissionError
+    with pytest.raises(PermissionError, match="disabled"):
+        await connector.discord_read_history(guild_id="禁止サーバー", channel_id="9001")
+
+    # 3. discord_search_messages searches forum threads & text channels case-insensitively with server name
+    search_forum = await connector.discord_search_messages(
+        query="interview_alpha",
+        guild_ids=["就活管理"],
+    )
+    assert "[Discord: 就活管理 / #🏢｜【総合】企業別 > Thread: アルファ株式会社]" in search_forum
+    assert "INTERVIEW_ALPHA" in search_forum
+
+    search_text = await connector.discord_search_messages(query="webテスト")
+    assert "ベータテック株式会社" in search_text
+    assert "書類選考通過、次回Webテスト案内" in search_text
+

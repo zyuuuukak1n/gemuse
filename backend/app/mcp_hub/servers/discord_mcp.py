@@ -18,6 +18,18 @@ logger = get_logger(__name__)
 
 PermissionLevel = Literal["disabled", "read_only", "read_write"]
 
+CHANNEL_TYPE_LABELS: dict[int, str] = {
+    0: "text",
+    5: "announcement",
+    11: "public_thread",
+    12: "private_thread",
+    15: "forum",
+    16: "media",
+}
+READABLE_CHANNEL_TYPES = tuple(CHANNEL_TYPE_LABELS.keys())
+FORUM_CHANNEL_TYPES = (15, 16)
+MAX_THREAD_FETCH_CONCURRENCY = 5
+
 
 class GuildPermission(BaseModel):
     """Per-guild permission entry parsed from config/discord_permissions.yaml."""
@@ -60,6 +72,36 @@ def load_discord_permissions(path: Path) -> DiscordPermissionsConfig:
         default_policy=default_pol,
         servers=[GuildPermission.model_validate(s) for s in normalized_servers],
     )
+
+
+def _match_guild_name(candidate: str, guilds: list[tuple[str, str]]) -> str | None:
+    """Resolve a guild name against (guild_id, name) pairs via exact then partial match."""
+    target = candidate.strip().lower()
+    if not target:
+        return None
+    for gid, name in guilds:
+        if name and name.strip().lower() == target:
+            return gid
+    for gid, name in guilds:
+        norm_name = name.strip().lower()
+        if norm_name and (target in norm_name or norm_name in target):
+            return gid
+    return None
+
+
+def _extract_searchable_text(msg: dict[str, Any]) -> str:
+    """Collect text across message content and embeds for case-insensitive matching."""
+    parts: list[str] = []
+    content = msg.get("content")
+    if isinstance(content, str) and content:
+        parts.append(content)
+    for emb in msg.get("embeds") or []:
+        if isinstance(emb, dict):
+            for key in ("title", "description"):
+                val = emb.get(key)
+                if isinstance(val, str) and val:
+                    parts.append(val)
+    return "\n".join(parts)
 
 
 class DiscordMCPConnector(BaseMCPConnector):
@@ -112,6 +154,56 @@ class DiscordMCPConnector(BaseMCPConnector):
             permission=self._permissions.default_policy,
         )
 
+    async def _resolve_guild_id(
+        self,
+        guild_id_or_name: str,
+        client: httpx.AsyncClient | None = None,
+    ) -> str:
+        """
+        Resolve a numeric guild_id or server name to a canonical numeric guild_id.
+
+        Checks `discord_permissions.yaml` first (exact ID, exact name, partial name),
+        and falls back to `GET /users/@me/guilds` if not matched locally.
+        """
+        raw = str(guild_id_or_name).strip()
+        if not raw:
+            return ""
+
+        for server in self._permissions.servers:
+            if server.guild_id == raw:
+                return raw
+
+        if raw.isdigit():
+            return raw
+
+        local_pairs = [(s.guild_id, s.name) for s in self._permissions.servers if s.name]
+        matched = _match_guild_name(raw, local_pairs)
+        if matched:
+            return matched
+
+        try:
+            if client is not None:
+                resp = await client.get("/users/@me/guilds")
+            else:
+                async with self._create_client() as temp_client:
+                    resp = await temp_client.get("/users/@me/guilds")
+            if resp.status_code == 200:
+                api_guilds = [
+                    (str(g.get("id", "")), str(g.get("name", "")))
+                    for g in (resp.json() or [])
+                    if isinstance(g, dict) and g.get("id")
+                ]
+                api_match = _match_guild_name(raw, api_guilds)
+                if api_match:
+                    return api_match
+        except Exception as exc:
+            logger.debug(
+                "Failed to query /users/@me/guilds during guild resolution",
+                extra={"query": raw, "error": mask_secrets(str(exc))},
+            )
+
+        return raw
+
     def _check_access(
         self,
         guild_id: str,
@@ -159,32 +251,133 @@ class DiscordMCPConnector(BaseMCPConnector):
                 raw_token=approval_token,
             )
 
+    async def _collect_forum_threads(
+        self,
+        client: httpx.AsyncClient,
+        guild_id: str,
+        forum_channel_id: str,
+    ) -> list[dict[str, Any]]:
+        """Gather active and public archived threads belonging to a forum/media channel."""
+        target_parent = str(forum_channel_id)
+        active_task = client.get(f"/guilds/{guild_id}/threads/active")
+        archived_task = client.get(f"/channels/{target_parent}/threads/archived/public")
+        active_resp, archived_resp = await asyncio.gather(
+            active_task, archived_task, return_exceptions=True
+        )
+
+        threads_by_id: dict[str, dict[str, Any]] = {}
+
+        if isinstance(active_resp, httpx.Response) and active_resp.status_code == 200:
+            payload = active_resp.json()
+            raw_active = payload.get("threads", []) if isinstance(payload, dict) else payload
+            for th in raw_active or []:
+                if isinstance(th, dict) and str(th.get("parent_id", "")) == target_parent:
+                    tid = str(th.get("id", ""))
+                    if tid and tid not in threads_by_id:
+                        threads_by_id[tid] = {**th, "_thread_state": "active"}
+
+        if isinstance(archived_resp, httpx.Response) and archived_resp.status_code == 200:
+            payload = archived_resp.json()
+            raw_archived = payload.get("threads", []) if isinstance(payload, dict) else payload
+            for th in raw_archived or []:
+                if isinstance(th, dict):
+                    tid = str(th.get("id", ""))
+                    if tid and tid not in threads_by_id:
+                        threads_by_id[tid] = {**th, "_thread_state": "archived"}
+
+        return list(threads_by_id.values())
+
+    async def _read_forum_history(
+        self,
+        client: httpx.AsyncClient,
+        policy: GuildPermission,
+        channel_id: str,
+        channel_name: str,
+    ) -> str:
+        """Expand all active and archived threads in a forum/media channel and read recent messages."""
+        guild_label = policy.name or policy.guild_id
+        threads = await self._collect_forum_threads(client, policy.guild_id, channel_id)
+        if not threads:
+            return wrap_untrusted_data(
+                f"discord:{guild_label}/#{channel_name}",
+                f"[Discord: {guild_label} / #{channel_name} (Forum)] スレッドが見つかりませんでした。",
+            )
+
+        sem = asyncio.Semaphore(MAX_THREAD_FETCH_CONCURRENCY)
+
+        async def _fetch_thread_block(th: dict[str, Any]) -> str:
+            tid = str(th.get("id", ""))
+            title = str(th.get("name", tid))
+            state = str(th.get("_thread_state", "active"))
+            async with sem:
+                resp = await client.get(
+                    f"/channels/{tid}/messages",
+                    params={"limit": 20},
+                )
+            if resp.status_code != 200:
+                return f"[Thread: {title}] (thread_id={tid}, status={state}) メッセージ取得失敗 (HTTP {resp.status_code})"
+
+            msgs = resp.json() or []
+            if not msgs:
+                return f"[Thread: {title}] (thread_id={tid}, status={state}) メッセージはありません。"
+
+            lines = [f"[Thread: {title}] (thread_id={tid}, status={state}, guild_id={policy.guild_id})"]
+            for m in msgs:
+                author = (m.get("author") or {}).get("username", "unknown")
+                ts = m.get("timestamp", "")
+                text = _extract_searchable_text(m)
+                lines.append(f"  ({ts}) @{author} [msg_id={m.get('id')}]: {text}")
+            return "\n".join(lines)
+
+        blocks = await asyncio.gather(
+            *(_fetch_thread_block(th) for th in threads),
+            return_exceptions=True,
+        )
+        rendered_blocks: list[str] = [
+            f"[Discord: {guild_label} / #{channel_name} (Forum, guild_id={policy.guild_id})] 合計 {len(threads)} スレッド"
+        ]
+        for th, block in zip(threads, blocks):
+            if isinstance(block, Exception):
+                rendered_blocks.append(
+                    f"[Thread: {th.get('name', th.get('id'))}] 取得エラー: {mask_secrets(str(block))}"
+                )
+            else:
+                rendered_blocks.append(block)
+
+        return wrap_untrusted_data(
+            f"discord:{guild_label}/#{channel_name}",
+            "\n\n".join(rendered_blocks),
+        )
+
     async def discord_list_channels(self, guild_id: str | None = None) -> str:
         """List accessible channels across permitted Discord guilds."""
-        target_guilds = (
-            [self._check_access(guild_id)]
-            if guild_id
-            else [s for s in self._permissions.servers if s.permission != "disabled"]
-        )
-        if not target_guilds:
-            return wrap_untrusted_data("discord:channels", "アクセス許可されたDiscordサーバーはありません。")
-
         async with self._create_client() as client:
+            if guild_id:
+                resolved_gid = await self._resolve_guild_id(guild_id, client=client)
+                target_guilds = [self._check_access(resolved_gid)]
+            else:
+                target_guilds = [s for s in self._permissions.servers if s.permission != "disabled"]
+
+            if not target_guilds:
+                return wrap_untrusted_data("discord:channels", "アクセス許可されたDiscordサーバーはありません。")
+
             async def _fetch_guild(policy: GuildPermission) -> str:
                 resp = await client.get(f"/guilds/{policy.guild_id}/channels")
                 resp.raise_for_status()
                 channels = resp.json()
                 lines: list[str] = []
+                guild_label = policy.name or policy.guild_id
                 for ch in channels:
                     cid = str(ch.get("id", ""))
                     if policy.allowed_channels and cid not in policy.allowed_channels:
                         continue
                     cname = ch.get("name", "unknown")
                     ctype = ch.get("type", 0)
-                    # Text/announcement/forum/thread channel types
-                    if ctype in (0, 5, 11, 12, 15):
+                    if ctype in READABLE_CHANNEL_TYPES:
+                        type_label = CHANNEL_TYPE_LABELS.get(ctype, f"type_{ctype}")
                         lines.append(
-                            f"- [Discord: {policy.name or policy.guild_id} / #{cname}] (channel_id={cid}, perm={policy.permission})"
+                            f"- [Discord: {guild_label} / #{cname}] "
+                            f"(guild_id={policy.guild_id}, channel_id={cid}, type={type_label}, perm={policy.permission})"
                         )
                 return "\n".join(lines)
 
@@ -212,15 +405,25 @@ class DiscordMCPConnector(BaseMCPConnector):
         channel_id: str,
         limit: int = 30,
     ) -> str:
-        """Read recent messages from an allowed Discord channel."""
-        policy = self._check_access(guild_id, channel_id, require_write=False)
+        """Read recent messages from an allowed Discord channel or expand forum threads."""
         clamped_limit = max(1, min(100, int(limit)))
 
         async with self._create_client() as client:
+            resolved_guild_id = await self._resolve_guild_id(guild_id, client=client)
+            policy = self._check_access(resolved_guild_id, channel_id, require_write=False)
+
             ch_resp = await client.get(f"/channels/{channel_id}")
             channel_name = channel_id
+            channel_type = 0
             if ch_resp.status_code == 200:
-                channel_name = ch_resp.json().get("name", channel_id)
+                ch_data = ch_resp.json()
+                channel_name = ch_data.get("name", channel_id)
+                channel_type = int(ch_data.get("type", 0) or 0)
+
+            if channel_type in FORUM_CHANNEL_TYPES:
+                return await self._read_forum_history(
+                    client, policy, str(channel_id), str(channel_name)
+                )
 
             msg_resp = await client.get(
                 f"/channels/{channel_id}/messages",
@@ -229,13 +432,13 @@ class DiscordMCPConnector(BaseMCPConnector):
             msg_resp.raise_for_status()
             messages = msg_resp.json()
 
-        guild_label = policy.name or guild_id
+        guild_label = policy.name or policy.guild_id
         citation = f"[Discord: {guild_label} / #{channel_name}]"
         formatted = []
         for m in messages:
             author = (m.get("author") or {}).get("username", "unknown")
             ts = m.get("timestamp", "")
-            text = m.get("content", "")
+            text = _extract_searchable_text(m)
             formatted.append(f"{citation} ({ts}) @{author} [msg_id={m.get('id')}]: {text}")
 
         body = "\n".join(formatted) if formatted else f"{citation} メッセージはありません。"
@@ -246,61 +449,101 @@ class DiscordMCPConnector(BaseMCPConnector):
         query: str,
         guild_ids: list[str] | None = None,
     ) -> str:
-        """Search messages in parallel across permitted Discord servers and channels."""
+        """Search messages across permitted Discord channels and forum threads using Bot-supported endpoints."""
         cleaned_query = query.strip().lower()
         if not cleaned_query:
             return wrap_untrusted_data("discord:search", "検索クエリが空です。")
 
-        if guild_ids:
-            policies = [self._check_access(gid, require_write=False) for gid in guild_ids]
-        else:
-            policies = [s for s in self._permissions.servers if s.permission != "disabled"]
-
-        if not policies:
-            return wrap_untrusted_data("discord:search", "検索対象の許可済みサーバーがありません。")
-
         async with self._create_client() as client:
+            if guild_ids:
+                resolved_ids = await asyncio.gather(
+                    *(self._resolve_guild_id(gid, client=client) for gid in guild_ids)
+                )
+                policies = [self._check_access(gid, require_write=False) for gid in resolved_ids]
+            else:
+                policies = [s for s in self._permissions.servers if s.permission != "disabled"]
+
+            if not policies:
+                return wrap_untrusted_data("discord:search", "検索対象の許可済みサーバーがありません。")
+
+            sem = asyncio.Semaphore(MAX_THREAD_FETCH_CONCURRENCY)
+
+            async def _search_message_target(
+                target_id: str,
+                citation: str,
+            ) -> list[str]:
+                async with sem:
+                    resp = await client.get(
+                        f"/channels/{target_id}/messages",
+                        params={"limit": 50},
+                    )
+                if resp.status_code != 200:
+                    return []
+                hits: list[str] = []
+                for msg in resp.json() or []:
+                    text = _extract_searchable_text(msg)
+                    if cleaned_query in text.lower():
+                        author = (msg.get("author") or {}).get("username", "unknown")
+                        hits.append(
+                            f"{citation} ({msg.get('timestamp', '')}) @{author}: {text}"
+                        )
+                return hits
+
             async def _scan_guild(policy: GuildPermission) -> list[str]:
                 ch_resp = await client.get(f"/guilds/{policy.guild_id}/channels")
                 ch_resp.raise_for_status()
-                channels = [
+                allowed_channels = [
                     ch
                     for ch in ch_resp.json()
-                    if ch.get("type", 0) in (0, 5, 11, 12)
+                    if ch.get("type", 0) in READABLE_CHANNEL_TYPES
                     and (
                         not policy.allowed_channels
                         or str(ch.get("id", "")) in policy.allowed_channels
                     )
                 ]
 
-                async def _scan_channel(ch: dict[str, Any]) -> list[str]:
-                    cid = str(ch.get("id", ""))
-                    cname = ch.get("name", cid)
-                    resp = await client.get(
-                        f"/channels/{cid}/messages",
-                        params={"limit": 50},
-                    )
-                    resp.raise_for_status()
-                    hits: list[str] = []
-                    guild_label = policy.name or policy.guild_id
-                    citation = f"[Discord: {guild_label} / #{cname}]"
-                    for msg in resp.json():
-                        content = msg.get("content", "")
-                        if cleaned_query in content.lower():
-                            author = (msg.get("author") or {}).get("username", "unknown")
-                            hits.append(
-                                f"{citation} ({msg.get('timestamp', '')}) @{author}: {content}"
-                            )
-                    return hits
+                guild_label = policy.name or policy.guild_id
+                scan_targets: list[tuple[str, str]] = []
 
-                ch_results = await asyncio.gather(
-                    *(_scan_channel(ch) for ch in channels[:15]),
+                forum_channels = [
+                    ch for ch in allowed_channels if ch.get("type", 0) in FORUM_CHANNEL_TYPES
+                ]
+                regular_channels = [
+                    ch for ch in allowed_channels if ch.get("type", 0) not in FORUM_CHANNEL_TYPES
+                ]
+
+                for ch in regular_channels[:15]:
+                    cid = str(ch.get("id", ""))
+                    cname = str(ch.get("name", cid))
+                    scan_targets.append((cid, f"[Discord: {guild_label} / #{cname}]"))
+
+                if forum_channels:
+                    forum_thread_lists = await asyncio.gather(
+                        *(
+                            self._collect_forum_threads(client, policy.guild_id, str(fc.get("id", "")))
+                            for fc in forum_channels
+                        ),
+                        return_exceptions=True,
+                    )
+                    for fc, th_list in zip(forum_channels, forum_thread_lists):
+                        if not isinstance(th_list, list):
+                            continue
+                        fc_name = str(fc.get("name", fc.get("id", "")))
+                        for th in th_list:
+                            tid = str(th.get("id", ""))
+                            tname = str(th.get("name", tid))
+                            scan_targets.append(
+                                (tid, f"[Discord: {guild_label} / #{fc_name} > Thread: {tname}]")
+                            )
+
+                target_results = await asyncio.gather(
+                    *(_search_message_target(tid, cit) for tid, cit in scan_targets),
                     return_exceptions=True,
                 )
                 collected: list[str] = []
-                for cr in ch_results:
-                    if isinstance(cr, list):
-                        collected.extend(cr)
+                for tr in target_results:
+                    if isinstance(tr, list):
+                        collected.extend(tr)
                 return collected
 
             guild_results = await asyncio.gather(
@@ -329,7 +572,8 @@ class DiscordMCPConnector(BaseMCPConnector):
         approval_token: str = "",
     ) -> str:
         """Post a message to a read_write Discord channel (requires valid approval token)."""
-        policy = self._check_access(guild_id, channel_id, require_write=True)
+        resolved_guild_id = await self._resolve_guild_id(guild_id)
+        policy = self._check_access(resolved_guild_id, channel_id, require_write=True)
         await self._require_approval("discord_post_message", approval_token)
 
         async with self._create_client() as client:
@@ -341,7 +585,7 @@ class DiscordMCPConnector(BaseMCPConnector):
             created = resp.json()
 
         msg_id = created.get("id", "")
-        guild_label = policy.name or guild_id
+        guild_label = policy.name or policy.guild_id
         return wrap_untrusted_data(
             f"discord:{guild_label}",
             f"[Discord: {guild_label} / #{channel_id}] 投稿完了 (message_id={msg_id})",
@@ -356,7 +600,8 @@ class DiscordMCPConnector(BaseMCPConnector):
         approval_token: str = "",
     ) -> str:
         """Edit an existing pinned summary message or post and pin a new summary message."""
-        policy = self._check_access(guild_id, channel_id, require_write=True)
+        resolved_guild_id = await self._resolve_guild_id(guild_id)
+        policy = self._check_access(resolved_guild_id, channel_id, require_write=True)
         await self._require_approval("discord_update_pinned_summary", approval_token)
 
         async with self._create_client() as client:
@@ -379,7 +624,7 @@ class DiscordMCPConnector(BaseMCPConnector):
                 pin_resp.raise_for_status()
                 action_desc = "新規投稿してピン留めしました"
 
-        guild_label = policy.name or guild_id
+        guild_label = policy.name or policy.guild_id
         return wrap_untrusted_data(
             f"discord:{guild_label}",
             f"[Discord: {guild_label} / #{channel_id}] {action_desc} (message_id={target_id})",
@@ -389,7 +634,7 @@ class DiscordMCPConnector(BaseMCPConnector):
         return [
             MCPTool(
                 name="discord_list_channels",
-                description="List permitted Discord servers and channels.",
+                description="List permitted Discord servers and channels including numeric guild_id, channel_id, and channel type.",
                 handler=self.discord_list_channels,
                 requires_approval=False,
                 source_type="discord",
@@ -397,7 +642,7 @@ class DiscordMCPConnector(BaseMCPConnector):
             ),
             MCPTool(
                 name="discord_read_history",
-                description="Read recent message history from a permitted Discord channel.",
+                description="Read recent messages from a Discord channel (accepts numeric guild_id or server name; auto-expands active/archived threads for forum channels).",
                 handler=self.discord_read_history,
                 requires_approval=False,
                 source_type="discord",
@@ -405,7 +650,7 @@ class DiscordMCPConnector(BaseMCPConnector):
             ),
             MCPTool(
                 name="discord_search_messages",
-                description="Search messages across permitted Discord servers in parallel.",
+                description="Search messages across permitted Discord channels and forum threads using Bot-supported REST endpoints (accepts numeric guild_ids or server names).",
                 handler=self.discord_search_messages,
                 requires_approval=False,
                 source_type="discord",
@@ -428,4 +673,3 @@ class DiscordMCPConnector(BaseMCPConnector):
                 already_wrapped=True,
             ),
         ]
-
